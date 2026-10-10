@@ -1,0 +1,159 @@
+/**
+ * @file QSerialPort
+ * @brief **测试专用**的 QSerialPort 替身（影子头文件）。
+ *
+ * 为什么用"影子头文件"而不是继承或 --wrap：
+ * ------------------------------------------------------------------
+ * `SerialLight` 把 `QSerialPort` 作为**具体类型**直接使用
+ * （`m_port = new QSerialPort(this)`、`m_port->write(...)`），既不是虚函数
+ * 也不是可注入的接口。本机（Windows/MinGW）没有真实串口，所以要让
+ * `serial_light.cpp` 的代码真正跑起来，只能在**编译期**把 `<QSerialPort>`
+ * 换成替身。
+ *
+ * 做法：把本文件命名为 `QSerialPort` 放在一个独立目录里，用
+ * `target_include_directories(... BEFORE ...)` 插到 Qt 的 include 路径**之前**。
+ * 于是 `#include <QSerialPort>` 命中的是这里。
+ * 已用探针实测确认该技巧确实生效（探针十六：
+ * `%TEMP%\probe33\shadow.cpp`，影子生效时退出码 0）。
+ *
+ * 为什么这比"只测能测的部分"更好：
+ * ------------------------------------------------------------------
+ * 测的是**真实的 serial_light.cpp**（同一个 .cpp、同一条代码路径），
+ * 只是把最底层的系统调用换成可记录的替身。这样"打开失败要发信号"、
+ * "写入不完整要发信号"、"未打开不许写"这些分支都能真的被执行到。
+ *
+ * 安全阀：
+ * ------------------------------------------------------------------
+ * 影子头会**顶掉**真正的 Qt 头。为了绝不可能在产线目标里被误命中，
+ * 这里要求必须显式定义 `ACC_SERIAL_LIGHT_TEST`；否则直接 `#error`。
+ * 只有 `desktop_test_serial_light` 这一个目标会定义它。
+ */
+#ifndef ACCESSTERMINAL_TESTS_FAKE_QSERIALPORT_H
+#define ACCESSTERMINAL_TESTS_FAKE_QSERIALPORT_H
+
+#ifndef ACC_SERIAL_LIGHT_TEST
+#  error "这个影子 QSerialPort 只能用于测试；请在测试目标上定义 ACC_SERIAL_LIGHT_TEST"
+#endif
+
+#include <QByteArray>
+#include <QIODevice>
+#include <QList>
+#include <QObject>
+#include <QString>
+
+// 记录结构只有一份定义（tests/fake_serial_port.h）。测试文件也用这一份，
+// 保证"替身写的"和"测试读的"是同一个结构体。
+#include "fake_serial_port.h"
+
+/**
+ * @brief QSerialPort 的最小替身，只实现 SerialLight 真正用到的那部分 API。
+ *
+ * 刻意**不**继承 QIODevice：SerialLight 只用到了 `QIODevice::ReadWrite` 这个
+ * 枚举值，以及"开/关/写/刷"四个动作，不需要 QIODevice 的读路径。
+ *
+ * 也刻意**不加 Q_OBJECT**：本头文件不在任何目标的源文件列表里，AUTOMOC 不会
+ * 处理它；而 SerialLight 从不 connect 这个类的信号/槽，因此不需要元对象。
+ * 加了反而会因缺少 moc 输出而链接失败。父对象机制由 QObject 基类提供，
+ * `new QSerialPort(this)` 依然能正常工作。
+ */
+class QSerialPort : public QObject
+{
+public:
+    // SerialLight 只用到 Baud9600（作为默认实参），其余仅补齐以免将来编译不过。
+    enum BaudRate {
+        Baud1200 = 1200,
+        Baud2400 = 2400,
+        Baud4800 = 4800,
+        Baud9600 = 9600,
+        Baud19200 = 19200,
+        Baud38400 = 38400,
+        Baud57600 = 57600,
+        Baud115200 = 115200
+    };
+    enum DataBits { Data5 = 5, Data6 = 6, Data7 = 7, Data8 = 8 };
+    enum Parity { NoParity = 0, EvenParity, OddParity, SpaceParity, MarkParity };
+    enum StopBits { OneStop = 1, OneAndHalfStop = 3, TwoStop = 2 };
+    enum FlowControl {
+        NoFlowControl = 0,
+        HardwareControl,
+        SoftwareControl
+    };
+
+    explicit QSerialPort(QObject* parent = nullptr) : QObject(parent) {}
+
+    bool isOpen() const { return m_open; }
+
+    void setPortName(const QString& name)
+    {
+        fakeSerialPort().portName = name;
+        ++fakeSerialPort().setPortNameCalls;
+    }
+    void setBaudRate(int baud)
+    {
+        fakeSerialPort().baudRate = baud;
+        ++fakeSerialPort().setBaudRateCalls;
+    }
+    void setDataBits(DataBits bits)
+    {
+        fakeSerialPort().dataBits = static_cast<int>(bits);
+        ++fakeSerialPort().dataBitsCalls;
+    }
+    void setParity(Parity p)
+    {
+        fakeSerialPort().parity = static_cast<int>(p);
+        ++fakeSerialPort().parityCalls;
+    }
+    void setStopBits(StopBits s)
+    {
+        fakeSerialPort().stopBits = static_cast<int>(s);
+        ++fakeSerialPort().stopBitsCalls;
+    }
+    void setFlowControl(FlowControl f)
+    {
+        fakeSerialPort().flowControl = static_cast<int>(f);
+        ++fakeSerialPort().flowControlCalls;
+    }
+
+    bool open(QIODevice::OpenMode mode)
+    {
+        FakeSerialPortRecord& r = fakeSerialPort();
+        ++r.openCalls;
+        r.lastOpenMode = static_cast<int>(mode);
+        r.openModeReadWrite = (mode == QIODevice::ReadWrite);
+        if (r.failOpen) {
+            m_open = false;
+            return false;
+        }
+        m_open = true;
+        return true;
+    }
+
+    void close()
+    {
+        ++fakeSerialPort().closeCalls;
+        m_open = false;
+    }
+
+    QString errorString() const { return fakeSerialPort().errorString; }
+
+    qint64 write(const QByteArray& data)
+    {
+        FakeSerialPortRecord& r = fakeSerialPort();
+        r.writes.append(data);
+        if (r.writeReturnOverride >= 0) {
+            return r.writeReturnOverride;
+        }
+        return static_cast<qint64>(data.size());
+    }
+
+    bool flush()
+    {
+        ++fakeSerialPort().flushCalls;
+        return true;
+    }
+
+private:
+    bool m_open = false;
+};
+
+#endif // ACCESSTERMINAL_TESTS_FAKE_QSERIALPORT_H

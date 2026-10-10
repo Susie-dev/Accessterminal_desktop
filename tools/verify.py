@@ -86,6 +86,104 @@ def _brace_matched_body(text, marker):
     return None
 
 
+def _strip_comments_keep_length(text):
+    """
+    与 `strip_comments_and_strings` 同类，但**严格保持长度**（逐字符等长）。
+
+    为什么要另写一个：`strip_comments_and_strings` 里
+    `re.sub(r"//[^\\n]*", "", text)` 是把行注释**整段删掉**的，文本会变短
+    （实测 serial_light.cpp：2105 字符 -> 1878 字符）。只要长度变了，
+    剥离后文本的下标就**不能**用来切原文，`_brace_matched_body_with_strings`
+    里那句"剥离后下标可直接切原文"的前提就不成立。
+
+    这里把注释一律替换成**等长的空格**、字符串字面量一律替换成**等长的
+    `"` 占位**（内容抹掉但保留定界符），于是长度与原文逐字符一致。
+    """
+    out = list(text)
+    n = len(text)
+    i = 0
+    while i < n:
+        c = text[i]
+        # 块注释
+        if c == "/" and i + 1 < n and text[i + 1] == "*":
+            j = text.find("*/", i + 2)
+            j = n if j < 0 else j + 2
+            for k in range(i, j):
+                if text[k] != "\n":
+                    out[k] = " "
+            i = j
+            continue
+        # 行注释
+        if c == "/" and i + 1 < n and text[i + 1] == "/":
+            j = text.find("\n", i)
+            j = n if j < 0 else j
+            for k in range(i, j):
+                out[k] = " "
+            i = j
+            continue
+        # 字符串 / 字符字面量
+        if c == '"' or c == "'":
+            j = i + 1
+            while j < n:
+                if text[j] == "\\":
+                    j += 2
+                    continue
+                if text[j] == c:
+                    break
+                j += 1
+            j = min(j, n - 1)
+            for k in range(i + 1, j):
+                if text[k] != "\n":
+                    out[k] = " "
+            i = j + 1
+            continue
+        i += 1
+    return "".join(out)
+
+
+def _brace_matched_body_with_strings(text, marker):
+    r"""
+    与 `_brace_matched_body` 相同，但返回的是**原文**切片（字符串字面量完整保留）。
+
+    为什么还需要另一个函数（第 33 轮实测的教训）
+    --------------------------------------------
+    `_brace_matched_body` 返回的是 `strip_comments_and_strings()` 之后的文本，
+    而那个函数会把字符串字面量**清空**（只留定界符）。于是任何"按函数体内
+    某个**字符串**的相对位置做判断"的规则都会失效：
+
+        check_serial_light_contract_is_pinned 第一版要在
+        `SerialLight::sendCommand()` 体内比较『未知的指令名称』与
+        『串口未打开』两条日志文案的先后。这两个待比较的东西**本身就是
+        字符串字面量**，剥掉之后 `find()` 全部返回 -1 -> 规则立刻报
+        "必须区分『未知的指令名称』这条分支"，**基线就不过**。
+        由本规则自己的故障注入当场抓到。
+
+    实现：用 `_strip_comments_keep_length()` 得到**等长**文本（它是逐字符
+    等长的，行注释也换成空格而不是删掉），据此定位配对的大括号；下标因此
+    可以直接用来切原文。若长度意外不等，返回 None 让调用方报"规则自身需
+    修复"，绝不悄悄用错位的切片。
+    """
+    code = _strip_comments_keep_length(text)
+    if len(code) != len(text):
+        return None
+    i = code.find(marker)
+    if i < 0:
+        return None
+    j = code.find("{", i)
+    if j < 0:
+        return None
+    depth = 0
+    for k in range(j, len(code)):
+        c = code[k]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return text[j + 1:k]
+    return None
+
+
 def check_includes(root, src_root):
     """
     本地 #include 必须可解析：相对当前文件目录，或相对 src/ 根。
@@ -3172,6 +3270,139 @@ def check_weather_service_contract_is_pinned(root, src_root):
             fail("[weather] weather_service.cpp 缺少 %s；%s。" % (needle, why))
 
 
+def check_serial_light_contract_is_pinned(root, src_root):
+    r"""
+    串口灯控里有几处**行为测试抓不到**（或抓不到全部）的契约，靠静态规则钉住。
+
+    `src/hal/serial_light.cpp` 第 33 轮才被首次链接进测试目标
+    （`desktop_test_serial_light`，用影子头 `tests/fake_serial_port/QSerialPort`
+    顶掉真正的 Qt 头）。故障注入 28 个变异全部被抓到，但下面这几条是
+    **静态规则能守而测试守不全**的：
+
+      1. **影子头不可能被产线目标误命中。**
+         `tests/fake_serial_port/QSerialPort` 会**顶掉**真正的 Qt 头。
+         万一有人把它加进产线目标的 include 路径，产线会拿替身跑，而且
+         编译链接**一切正常** —— 这是最危险的一类错误。所以替身头里必须有
+         `#error` 安全阀（要求显式定义 ACC_SERIAL_LIGHT_TEST）。
+         这里从**测试目标的 CMake**侧再守一道：只有测试目标能定义那个宏。
+
+      2. **`QIODevice::ReadWrite` 与 8N1/无流控这四个取值。**
+         测试用裸数值断言（Data8=8 等），但若有人把源码和替身里的枚举
+         **一起**改掉（例如把 Data8 定义成 7），裸数值断言仍会红，可替身
+         与真 Qt 就此分道扬镳，而"产线用真 Qt"这一侧没人测。这里按源码文本
+         钉住 Must-Be 的四个符号名。
+
+      3. **两条失败分支的日志前缀。** 现场排障靠 `[灯控]` 这个前缀过滤；
+         测试只断言了"有某个串"，没断言前缀本身。改掉前缀会让运维的过滤
+         规则失效，而单元测试全绿。
+
+      4. **`sendCommand()` 里两个前置检查的次序。** "指令名未知"必须先于
+         "串口未打开"判断：配置键名打错比设备没插更该被明确指出，否则现场
+         会一直去查串口线。测试只用日志区分这一条（`unknownNameIsCheckedBeforePortState`），
+         而日志顺序本身不是返回值能体现的，再按文本守一道更稳。
+    """
+    sl = os.path.join(src_root, "hal", "serial_light.cpp")
+    if not os.path.exists(sl):
+        return  # 本仓库没有该模块，规则安全通过
+    text = io.open(sl, encoding="utf-8", errors="replace").read()
+
+    # ---- 2) 8N1 + 无流控 + 读写模式（按符号名，不看枚举数值）----
+    for needle, why in (
+            ('setDataBits(QSerialPort::Data8)',
+             "数据位必须是 8（与重构前一致）"),
+            ('setParity(QSerialPort::NoParity)',
+             "校验位必须是无校验"),
+            ('setStopBits(QSerialPort::OneStop)',
+             "停止位必须是 1 位"),
+            ('setFlowControl(QSerialPort::NoFlowControl)',
+             "流控必须关闭"),
+            ('open(QIODevice::ReadWrite)',
+             "串口必须以可读可写方式打开"),
+    ):
+        if needle not in text:
+            fail("[serial] serial_light.cpp 缺少 %s；%s。" % (needle, why))
+
+    # ---- 3) 日志前缀 ----
+    if '[灯控]' not in text:
+        fail("[serial] serial_light.cpp 的日志应带 '[灯控]' 前缀 —— "
+             "现场排障靠它过滤；测试只断言了后半个串，前缀被改掉测试仍是绿的。")
+
+    # ---- 4) 两个前置检查的次序（按函数体内的相对位置）----
+    # 必须用 _brace_matched_body_with_strings：待比较的两条日志文案本身
+    # 就是字符串字面量，而 _brace_matched_body 会把它们清空（见该函数说明）。
+    body = _brace_matched_body_with_strings(
+        text, "bool SerialLight::sendCommand(const QString& name)")
+    if body is None:
+        fail("[serial] 无法在 serial_light.cpp 里定位 "
+             "SerialLight::sendCommand() 的函数体（规则自身需要修复）。")
+    else:
+        i_unknown = body.find("未知的指令名称")
+        i_notopen = body.find("串口未打开")
+        if i_unknown < 0:
+            fail("[serial] sendCommand() 必须区分『未知的指令名称』这条分支"
+                 "（现场靠它与『串口未打开』区分）。")
+        elif i_notopen < 0:
+            fail("[serial] sendCommand() 必须区分『串口未打开』这条分支。")
+        elif i_unknown > i_notopen:
+            fail("[serial] sendCommand() 里『未知的指令名称』的判断必须在"
+                 "『串口未打开』**之前**：配置键名打错比设备没插更该被明确"
+                 "指出，否则现场会一直去查串口线。")
+
+    # ---- 1) 影子头的安全阀，以及"只有测试目标能定义那个宏" ----
+    #
+    # ⚠ 必须先**剥掉注释再检查**。
+    # 第一版直接对原文做 `"#error" not in shim_text`，结果把安全阀整段删掉
+    # 之后规则**仍然通过** —— 因为头顶的文档注释里就写着
+    # "否则直接 `#error`" 和 "必须显式定义 `ACC_SERIAL_LIGHT_TEST`"，
+    # 替真指令顶了包（第 33 轮故障注入当场抓到）。
+    # 这正是"守卫条件不得引用被守卫内容里也出现的字符串"那条规矩，只不过
+    # 冒出来的是**文档注释**这个很自然的出处。
+    shim = os.path.join(root, "tests", "fake_serial_port", "QSerialPort")
+    if not os.path.exists(shim):
+        fail("[serial] 缺少影子头 tests/fake_serial_port/QSerialPort —— "
+             "desktop_test_serial_light 靠它把 QSerialPort 换成替身。")
+        return
+    shim_text = io.open(shim, encoding="utf-8", errors="replace").read()
+    # 去掉注释（块注释与行注释），只留真正的预处理指令。
+    shim_code = re.sub(r"/\*.*?\*/", " ", shim_text, flags=re.S)
+    shim_code = re.sub(r"//[^\n]*", " ", shim_code)
+    # 注意 `#error` 中间允许有空白：本影子头写的是 `#  error "..."`，
+    # 直接找字面量 `"#error"` 会假报缺失（基线就不过）。
+    has_guard = (re.search(r"#\s*ifndef\s+ACC_SERIAL_LIGHT_TEST", shim_code)
+                 and re.search(r"#\s*error\b", shim_code))
+    if not has_guard:
+        fail("[serial] 影子头必须带真正的 `#ifndef ACC_SERIAL_LIGHT_TEST` + "
+             "`#error` 安全阀（注释里提过不算）：它保证只有测试目标能命中"
+             "替身，否则**产线目标一旦误命中就会拿替身跑，而且编译链接一切"
+             "正常** —— 这是最危险的一类错误。")
+    else:
+        # 安全阀只在**未**定义该宏时报错，所以还须确认该宏确实只在测试目标上
+        # 被 define。同样要剥注释：CMakeLists 的说明注释里多次提到这两个词。
+        tests_cmake = os.path.join(root, "tests", "CMakeLists.txt")
+        if os.path.exists(tests_cmake):
+            cm_raw = io.open(tests_cmake, encoding="utf-8",
+                             errors="replace").read()
+            # CMake 的行注释以 # 开头（允许前导空白）。
+            cm = "\n".join(l for l in cm_raw.split("\n")
+                           if not l.lstrip().startswith("#"))
+            if not re.search(r"target_include_directories\s*\([^)]*fake_serial_port",
+                             cm, re.S):
+                fail("[serial] tests/CMakeLists.txt 没有把 fake_serial_port "
+                     "目录真正加进 target_include_directories（只写个 "
+                     "`fake_serial_port.cpp` 源文件是不够的，注释里提过也不"
+                     "算），影子头不会被命中；测试实际在链真的 QSerialPort，"
+                     "那这个替身就是摆设。")
+            if "ACC_SERIAL_LIGHT_TEST" not in cm:
+                fail("[serial] tests/CMakeLists.txt 没有真正定义 "
+                     "ACC_SERIAL_LIGHT_TEST（注释里提过不算），影子头的安全阀"
+                     "会直接 #error，测试根本编译不过。")
+            if not re.search(
+                    r"target_include_directories\s*\(\s*\w+\s+BEFORE\b", cm):
+                fail("[serial] tests/CMakeLists.txt 的 target_include_directories "
+                     "必须带 BEFORE：否则影子头目录排在 Qt 的 include 之后，"
+                     "`#include <QSerialPort>` 仍会命中真 Qt 头。")
+
+
 def check_cross_repo_test_targets_are_unique(root, extra_root):
     """
     两个仓库的测试目标名必须互不冲突，否则**超级工程无法配置**。
@@ -3275,6 +3506,7 @@ def main():
     check_fault_harnesses_classify_crashes_correctly(root, src_root)
     check_monitor_client_contract_is_pinned(root, src_root)
     check_weather_service_contract_is_pinned(root, src_root)
+    check_serial_light_contract_is_pinned(root, src_root)
     check_fake_fingerprint_builds_same_bytes(root, src_root)
     check_fingerprint_checksum_logic_is_not_duplicated(root, src_root)
     check_gated_wire_paths_have_resume_test(root, src_root)

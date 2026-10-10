@@ -194,3 +194,59 @@ target_link_libraries(desktop_test_weather_service PRIVATE
 )
 
 add_test(NAME desktop_weather_service COMMAND desktop_test_weather_service)
+
+# ---------------------------------------------------------------------------
+# SerialLight：室内机串口灯控
+#
+# `src/hal/serial_light.cpp` 此前**从未被任何测试目标链接**。它只有 89 行，
+# 却是"把灯控指令写到硬件"的唯一出口，且有两条**只靠日志区分**的失败分支
+# （指令名未知 / 串口未打开）——现场排障完全依赖这两条日志分得清楚。
+#
+# 难点：SerialLight 把 QSerialPort 当**具体类型**用（new QSerialPort(this)、
+# m_port->write(...)），既不是虚函数也不可注入；本机（Windows/MinGW）又没有
+# 真实串口。两条路都试过：
+#   - 用 Windows 命名管道冒充串口：实测会卡在 QSerialPort::open()，且依赖
+#     `\\.\pipe\` 这个平台细节，脆弱且不可移植 -> 放弃；
+#   - **影子头文件**：把替身命名为 `QSerialPort` 放在 tests/fake_serial_port/，
+#     用 `target_include_directories(BEFORE ...)` 插到 Qt 的 include 路径之前，
+#     于是 `#include <QSerialPort>` 命中替身。已用探针实测确认生效
+#     （%TEMP%\probe33\shadow.cpp：影子生效时退出码 0）。
+#
+# 这样测的仍是**真实的 serial_light.cpp**、同一条代码路径，只把最底层的系统
+# 调用换成可记录的替身；"打开失败要发信号"、"写入不完整要发信号"、"未打开
+# 不许写"这些分支都能真的被执行到，而不是靠读代码推断。
+#
+# 安全阀：影子头会顶掉真正的 Qt 头，因此它要求显式定义 ACC_SERIAL_LIGHT_TEST，
+# 否则直接 `#error`。只有本目标定义它，产线目标不可能误命中。
+# 另：影子头不在任何目标的源列表里，AUTOMOC 不会处理它，所以它**不带
+# Q_OBJECT**（SerialLight 也从不 connect 它的信号）。
+# ---------------------------------------------------------------------------
+add_executable(desktop_test_serial_light
+    test_serial_light.cpp
+    fake_serial_port.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/hal/serial_light.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/config/app_config.cpp
+)
+
+# BEFORE 是关键：必须排在 Qt5::SerialPort 带来的 include 目录**之前**，
+# 影子头才会被命中。少了 BEFORE 就会悄悄用上真的 Qt 头，而测试表现是
+# "链接期缺少 QSerialPort 的符号"，很容易误判成别的毛病。
+target_include_directories(desktop_test_serial_light BEFORE PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/fake_serial_port
+)
+
+target_include_directories(desktop_test_serial_light PRIVATE
+    ${ACCESSTERMINAL_SRC_ROOT}
+    ${CMAKE_CURRENT_LIST_DIR}
+)
+
+target_compile_definitions(desktop_test_serial_light PRIVATE
+    ACC_SERIAL_LIGHT_TEST
+)
+
+target_link_libraries(desktop_test_serial_light PRIVATE
+    Qt5::Core
+    Qt5::Test
+)
+
+add_test(NAME desktop_serial_light COMMAND desktop_test_serial_light)

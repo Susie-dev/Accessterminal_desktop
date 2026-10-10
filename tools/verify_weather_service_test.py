@@ -14,6 +14,9 @@ import os
 import re
 import shutil
 import subprocess
+# 注意：判定 FAIL 行只看行首 ``FAIL!``，**不要**去匹配用例名的形状。
+# 数据驱动用例输出的是 ``Class::case(desk)`` 而不是 ``Class::case()``，
+# 用 ``\w+::(\w+)\(\)`` 会漏掉它们，把正常的断言失败误判成崩溃。
 import sys
 
 for _s in (sys.stdout, sys.stderr):
@@ -363,7 +366,7 @@ def main():
         return 2
     rr = run_exe()
     out = (rr.stdout + rr.stderr).decode('utf-8', 'replace')
-    base_fail = len(re.findall(r'^FAIL!\s*:\s*\w+::(\w+)\(\)', out, re.M))
+    base_fail = len(re.findall(r'^FAIL!\s*:', out, re.M))
     tot = re.search(r'Totals:\s*(\d+) passed,\s*(\d+) failed', out)
     print('基线: %s' % (tot.group(0) if tot else '(无 Totals)'))
     if base_fail != 0:
@@ -401,7 +404,7 @@ def main():
 
             rr = run_exe()
             out = (rr.stdout + rr.stderr).decode('utf-8', 'replace')
-            failed = re.findall(r'^FAIL!\s*:\s*\w+::(\w+)\(\)', out, re.M)
+            failed = re.findall(r'^FAIL!\s*:', out, re.M)
             crashed = rr.returncode != 0 and not failed
             totals = re.search(r'Totals:\s*(\d+) passed,\s*(\d+) failed', out)
             consistent = (totals is not None
@@ -461,7 +464,7 @@ def main():
             continue
         rr = run_exe()
         out = (rr.stdout + rr.stderr).decode('utf-8', 'replace')
-        failed = re.findall(r'^FAIL!\s*:\s*\w+::(\w+)\(\)', out, re.M)
+        failed = re.findall(r'^FAIL!\s*:', out, re.M)
         crashed = rr.returncode != 0 and not failed
         if failed or crashed:
             print('  *** %-46s 竟然被抓到了（%d 条 FAIL, rc=%d）'

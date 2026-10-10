@@ -97,11 +97,13 @@ cmake --build /tmp/desktop-tests
 ctest --test-dir /tmp/desktop-tests --output-on-failure
 ```
 
-当前 5 个目标：`desktop_protocol`（协议编解码）、`desktop_app_config`
+当前 6 个目标：`desktop_protocol`（协议编解码）、`desktop_app_config`
 （配置与灯控指令解析）、`desktop_signaling_server`（TCP 8887 信令服务端，
 真实 socket 端到端）、`desktop_monitor_client`（**UDP 50000 远程预览客户端**，
 真实 socket + 环回别名假门口机，31 个用例）、`desktop_weather_service`
-（**天气获取与文案格式化**，真实 QTcpServer 当天气接口，27 个用例）。
+（**天气获取与文案格式化**，真实 QTcpServer 当天气接口，27 个用例）、
+`desktop_serial_light`（**串口灯控**，影子头替身取代 QSerialPort，
+34 个用例）。
 
 > `tests/CMakeLists.txt` 此前缺 `cmake_minimum_required`/`project()`，独立构建
 > 会直接配置失败；补上之后又会因为缺 `enable_testing()` 而"构建成功、
@@ -303,7 +305,7 @@ bind、`newConnection`、`readyRead` 派发、`disconnected` 清理一并被验�
 
 ## 关键约定（由自动化检查强制）
 
-以下五十五条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+以下五十九条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
 `tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
 
 ### 1. 音视频通道只在接听后建立
@@ -823,33 +825,40 @@ a.write("l\n");            // 只有补上 A 自己的后半，才应出现 Call
 补上 gcov 度量后，第一个数字是 **93.6%**。把从未被链接的产线文件折进分母后，
 真实值是 **16.2%**。
 
-原因在**分母**：93.6% 只统计被链接进测试目标的文件。另有 **13 个产线源
-文件（约 1046 行）从未被任何测试目标链接**：
+原因在**分母**：93.6% 只统计被链接进测试目标的文件。另有 **12 个产线源
+文件（约 976 行）从未被任何测试目标链接**：
 
 | 从未被任何测试链接的产线文件 | 说明 |
 | --- | --- |
 | `src/ui/widget.cpp` | 主窗口，最长的一个 |
 | `src/core/media/call_session.cpp` | 通话会话 |
-| `src/hal/serial_light.cpp` | 串口灯控 |
 | `src/ui/form_phonecall.cpp` | 通话界面 |
 | `src/ui/slidehintwidget.cpp` | 滑动提示控件 |
 | `src/main.cpp` 及其余头文件 | — |
 
-> 第 31、32 轮各移出一个：
+> 第 31～33 轮各移出一个：
 > `src/core/net/monitor_client.cpp`（新增 `desktop_monitor_client` 后
-> 318 行覆盖 298 行，"可达未测"降为 **0**）与
-> `src/core/weather/weather_service.cpp`（新增 `desktop_weather_service`）。
+> 318 行覆盖 298 行，"可达未测"降为 **0**）、
+> `src/core/weather/weather_service.cpp`（新增 `desktop_weather_service`）、
+> `src/hal/serial_light.cpp`（新增 `desktop_serial_light`，用影子头替身
+> 取代 QSerialPort 后 89 行全覆盖）。
 
 `tools/run_coverage.sh` 一键产出：
 
 ```
-已测文件 375 行（覆盖 357）+ 未测文件约 1046 行 = 分母 1421
-近似总覆盖率 = 25.1%   （上表那个 95.2% 仅描述已测文件）
+已测文件 416 行（覆盖 398）+ 未测文件约 976 行 = 分母 1392
+近似总覆盖率 = 28.6%   （上表那个 95.7% 仅描述已测文件）
 ```
 
 被测到的文件覆盖度本身不错：`src/core/net/signaling_server.cpp` 76/76 = 100%，
-`src/config/app_config.cpp` 100%，`src/core/net/monitor_client.cpp` 可达部分
-100%，合计 375 行中 357 行（95.2%）。
+`src/core/weather/weather_service.cpp` 56/56 = 100%，
+`src/hal/serial_light.cpp` 41/41 = 100%，`src/core/net/monitor_client.cpp`
+可达部分 100%（无"可达未测"行），合计 416 行中 398 行（95.7%）。
+
+余下未覆盖的集中在 `src/config/app_config.cpp`（122 行测 109）与
+`src/core/net/protocol.h`（58 行测 56）：`app_config.cpp` 有 7 行
+**可达未测**（L65、L154-155、L273、L275、L283-284），`protocol.h`
+有 2 行（L152、L279）——**待办看的就是"可达未测"这一列**。
 
 **数字正确、口径错误，比没有数字更危险** —— 它会让人停止寻找缺口。
 
@@ -1370,6 +1379,87 @@ i_null < i_abort` 之后才对。
 这是本规则自己的故障注入当场抓到的 —— **规则和被测代码一样需要证明**；
 一条基线就不过的规则如果被"顺手放宽到能过"，往往会把真正的约束也一起丢掉。
 
+### 56. 影子头文件：给"具体类型"的第三方依赖做测试替身
+
+`src/hal/serial_light.cpp` 第 33 轮才首次进测试。它把 `QSerialPort` 当
+**具体类型**用（`new QSerialPort(this)`、`m_port->write(...)`），既非虚函数
+也不可注入，而开发机上没有真实串口。两条路都试过：
+
+| 办法 | 结果 |
+| --- | --- |
+| Windows 命名管道冒充串口（`setPortName("pipe\\x")` -> `\\.\pipe\x`） | **放弃**：实测卡在 `QSerialPort::open()`，且依赖 `\\.\pipe\` 平台细节 |
+| **影子头文件** | **采用**：把替身命名为 `QSerialPort` 放在 `tests/fake_serial_port/`，用 `target_include_directories(BEFORE ...)` 插到 Qt 的 include 路径之前 |
+
+已用探针确认影子确实生效（`%TEMP%\probe33\shadow.cpp`，影子生效时退出码 0）。
+于是测的仍是**真实的 `serial_light.cpp`**、同一条代码路径，只把最底层的
+系统调用换成可记录的替身；"打开失败要发信号"、"写入不完整要发信号"、
+"未打开不许写"这些分支都能真的被执行到。
+
+三条必须记住的配套要求：
+
+1. **影子头必须自带 `#error` 安全阀**（要求显式定义 `ACC_SERIAL_LIGHT_TEST`）。
+   它会**顶掉**真正的 Qt 头 —— 万一被产线目标误命中，产线就拿替身跑，而且
+   编译链接**一切正常**。这是最危险的一类错误。
+2. **必须带 `BEFORE`**。少了它影子头排在 Qt 之后，`#include <QSerialPort>`
+   仍命中真 Qt 头，而测试表现是"链接期缺少 QSerialPort 的符号"，极易误判。
+3. **替身不要加 `Q_OBJECT`**。它不在任何目标的源列表里，AUTOMOC 不会处理，
+   加了会因缺 moc 输出而链接失败（`SerialLight` 也从不 connect 它的信号）。
+
+### 57. 故障注入的判定：**别去匹配用例名的形状**
+
+第 33 轮发现一个潜伏在已有夹具里的 bug。判"是否崩溃"用的是
+`returncode != 0 and not failed`，而 `failed` 来自
+
+```python
+re.findall(r'^FAIL!\s*:\s*\w+::(\w+)\(\)', out, re.M)   # 过窄
+```
+
+数据驱动用例输出的是 `FAIL!  : Class::case(desk)`，**不是** `case()`。
+于是那条用例失败时 `failed` 为空 -> 退出码非零 -> 被判成**崩溃**。
+实测：把 `desk` 指令的一个字节改掉，一条正常的断言失败被报成
+"崩溃(rc=1, 0 条 FAIL 行)"。
+
+正确写法是只看行首标记，不依赖用例名的形状：
+
+```python
+re.findall(r'^FAIL!\s*:', out, re.M)
+```
+
+`verify_monitor_client_test.py` 与 `verify_weather_service_test.py` 里同款
+正则已一并改掉 —— 它们当时只是**碰巧**没有数据驱动用例才没暴露。
+
+### 58. 静态规则要**剥掉注释**再检查
+
+`check_serial_light_contract_is_pinned` 第一版检查影子头里有没有 `#error`
+安全阀，写法是 `"#error" not in shim_text`。故障注入把安全阀整段删掉之后
+规则**仍然通过** —— 因为头顶的**文档注释**里就写着"否则直接 `#error`"，
+替真指令顶了包。
+
+同理，检查 `tests/CMakeLists.txt` 是否引用 `fake_serial_port` 目录时，
+只搜子串也不行：源文件列表里的 `fake_serial_port.cpp` 会顶包。必须正则匹配
+真正的 `target_include_directories(...)` 调用。
+
+> 这是"**守卫条件不得引用被守卫内容里也出现的字符串**"那条规矩的又一变体，
+> 只不过冒出来的出处是**文档注释**和**同名字源文件** —— 两者都极其自然，
+> 所以更容易中招。
+
+### 59. 用 `_brace_matched_body` 就只能看代码，看不了字符串
+
+`_brace_matched_body()` 走的是 `strip_comments_and_strings()`，而后者会把
+字符串字面量**清空**（只留定界符）。于是任何"按函数体内某个**字符串**的
+相对位置判断"的规则必然失效：待比较的两个东西本身就是字符串字面量，
+剥掉后 `find()` 全返回 -1。
+
+因此新增了 `_brace_matched_body_with_strings()`，返回**保留字符串的原文
+切片**。它用新写的 `_strip_comments_keep_length()` 定位括号 —— 后者的关键
+性质是**逐字符等长**（行注释也换成空格而不是删掉），下标因此可以直接用来
+切原文。
+
+> 注意：不要指望 `strip_comments_and_strings()` 保长 —— 它把行注释**整段
+> 删除**（实测 `serial_light.cpp`：2105 字符 -> 1878 字符）。新函数里有一道
+> `len(code) != len(text)` 的断言，长度一旦不等就返回 `None` 让调用方报
+> "规则自身需修复"，绝不悄悄用错位的切片。
+
 ## 开发约定
 
 - **标准**：C++11
@@ -1418,6 +1508,8 @@ python3 tools/verify_monitor_client_rule.py
 python3 tools/verify_monitor_client_test.py
 python3 tools/verify_weather_service_rule.py
 python3 tools/verify_weather_service_test.py
+python3 tools/verify_serial_light_rule.py
+python3 tools/verify_serial_light_test.py
 bash tools/run_coverage.sh
 
 # 3. 跨仓库协议一致性
