@@ -96,7 +96,20 @@ void MonitorClient::onReadyRead()
     while (m_socket->hasPendingDatagrams()) {
         QByteArray datagram;
         datagram.resize(static_cast<int>(m_socket->pendingDatagramSize()));
-        m_socket->readDatagram(datagram.data(), datagram.size());
+
+        // 不能忽略 readDatagram 的返回值：QByteArray::resize() 不会清零
+        // 新分配的内存。若实际读到的字节数少于 pendingDatagramSize()，
+        // 尾部就是未初始化字节（或上一次循环的残留），直接交给
+        // loadFromData() 会解析到垃圾数据。
+        // 正常情况下返回值等于 datagram.size()，行为与重构前一致。
+        // 与门口机 camera_preview_server.cpp 的处理保持对称。
+        const qint64 bytesRead = m_socket->readDatagram(datagram.data(), datagram.size());
+        if (bytesRead < 0) {
+            continue; // 读取失败，丢弃该数据报
+        }
+        if (bytesRead < datagram.size()) {
+            datagram.resize(static_cast<int>(bytesRead));
+        }
 
         // 每包即一帧完整 JPEG。
         QPixmap pix;

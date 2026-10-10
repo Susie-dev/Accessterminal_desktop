@@ -41,6 +41,14 @@ signals:
 private:
     void onFinished();
 
+    /**
+     * 丢弃当前在途请求（断开信号 → 摘除成员 → abort/deleteLater）。
+     * 顺序不可调换：abort() 可能同步投递 finished()，若先 abort 会重入
+     * onFinished() 并把 m_reply 置空，随后对本函数内的 m_reply 解引用即为
+     * 空指针。详见 .cpp 中的说明。
+     */
+    void abandonReply();
+
     QNetworkAccessManager* m_manager = nullptr;
     QNetworkReply* m_reply = nullptr;
 };
