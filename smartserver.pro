@@ -1,40 +1,53 @@
-QT       += core gui network multimedia serialport
+# ============================================================================
+# Accessterminal_desktop — 室内机（对讲主机 / 控制面板）
+#
+# 说明：本文件为兼容 Qt Creator / qmake 工作流的构建脚本。
+#       推荐入口为 CMakeLists.txt，两者源文件集合保持一致。
+# ============================================================================
 
+QT += core gui network multimedia serialport
 greaterThan(QT_MAJOR_VERSION, 4): QT += widgets
 
-CONFIG += c++11
+CONFIG += c++11 warn_on
 
-# The following define makes your compiler emit warnings if you use
-# any Qt feature that has been marked deprecated (the exact warnings
-# depend on your compiler). Please consult the documentation of the
-# deprecated API in order to know how to port your code away from it.
-DEFINES += QT_DEPRECATED_WARNINGS
+TARGET = smartserver
+TEMPLATE = app
 
-# You can also make your code fail to compile if it uses deprecated APIs.
-# In order to do so, uncomment the following line.
-# You can also select to disable deprecated APIs only up to a certain version of Qt.
-#DEFINES += QT_DISABLE_DEPRECATED_BEFORE=0x060000    # disables all the APIs deprecated before Qt 6.0.0
+# 使源码内 #include "core/net/protocol.h" 等以 src/ 为根
+INCLUDEPATH += $$PWD/src
 
 SOURCES += \
-    form_phonecall.cpp \
-    main.cpp \
-    slidehintwidget.cpp \
-    widget.cpp
+    src/main.cpp \
+    src/config/app_config.cpp \
+    src/core/net/signaling_server.cpp \
+    src/core/net/monitor_client.cpp \
+    src/core/media/call_session.cpp \
+    src/core/weather/weather_service.cpp \
+    src/hal/serial_light.cpp \
+    src/ui/widget.cpp \
+    src/ui/form_phonecall.cpp \
+    src/ui/slidehintwidget.cpp
 
 HEADERS += \
-    appconfig.h \
-    form_phonecall.h \
-    slidehintwidget.h \
-    widget.h
+    src/config/app_config.h \
+    src/core/net/protocol.h \
+    src/core/net/signaling_server.h \
+    src/core/net/monitor_client.h \
+    src/core/media/call_session.h \
+    src/core/weather/weather_service.h \
+    src/hal/serial_light.h \
+    src/ui/widget.h \
+    src/ui/form_phonecall.h \
+    src/ui/slidehintwidget.h
 
 FORMS += \
-    form_phonecall.ui \
-    widget.ui
+    src/ui/widget.ui \
+    src/ui/form_phonecall.ui
+
+RESOURCES += \
+    src/resources/res.qrc
 
 # Default rules for deployment.
 qnx: target.path = /tmp/$${TARGET}/bin
 else: unix:!android: target.path = /opt/$${TARGET}/bin
 !isEmpty(target.path): INSTALLS += target
-
-RESOURCES += \
-    res.qrc

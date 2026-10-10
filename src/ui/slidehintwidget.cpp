@@ -1,5 +1,5 @@
 // 引入项目内部头文件 "slidehintwidget.h"。
-#include "slidehintwidget.h"
+#include "ui/slidehintwidget.h"
 // 引入系统或第三方头文件 <QPainter>。
 #include <QPainter>
 // 引入系统或第三方头文件 <QLinearGradient>。

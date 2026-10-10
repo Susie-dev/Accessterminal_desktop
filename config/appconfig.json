@@ -1,0 +1,35 @@
+{
+  "_comment": "Accessterminal 室内机配置。部署路径 /etc/accessterminal/appconfig.json。所有字段均可用环境变量覆盖，详见 src/config/app_config.h。",
+
+  "network": {
+    "_comment": "self_ip = 本机(室内机)地址；device_ip = T113 门口机地址，远程监看推流目标；signaling_port 由门口机主动连接",
+    "self_ip": "192.168.1.4",
+    "device_ip": "192.168.1.8",
+    "signaling_port": 8887
+  },
+
+  "hardware": {
+    "_comment": "灯控串口。原实现硬编码为 Windows 的 COM24，在 Linux 下必须改为 /dev/ttyUSBx 或 /dev/ttySx",
+    "serial_port": "/dev/ttyUSB0"
+  },
+
+  "weather": {
+    "_comment": "天气接口，留空字符串可禁用天气刷新",
+    "url": "http://t.weather.itboy.net/api/weather/city/101230101"
+  },
+
+  "media": {
+    "_comment": "门铃音资源与音量(0-100)",
+    "ringtone": "qrc:/door.mp3",
+    "ringtone_volume": 100
+  },
+
+  "lights": {
+    "_comment": "灯控串口指令，十六进制字节串。原值来自 widget.h 的 hexArray*，禁止随意改动。",
+    "desk": "FD034C12045DDF",
+    "work": "FD034C12025DDF",
+    "work_round": "FD039736F44FDF",
+    "desk_round": "FD039736F250DF",
+    "wall": "FD039736F150DF"
+  }
+}
