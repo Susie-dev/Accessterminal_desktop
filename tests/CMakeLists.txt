@@ -151,3 +151,46 @@ target_link_libraries(desktop_test_monitor_client PRIVATE
 )
 
 add_test(NAME desktop_monitor_client COMMAND desktop_test_monitor_client)
+
+# ---------------------------------------------------------------------------
+# WeatherService：天气获取与文案格式化
+#
+# 这个文件此前**从未被任何测试目标链接**。它做三件都会伤到用户的事：
+# 解析第三方 JSON、拼出用户直接看到的文案、出错时 emit errorOccurred。
+#
+# 起因是它代码里最长的那段注释（abandonReply() 上方）断言的是一条
+# **从未被验证过的因果链**。第 32 轮用探针实测（%TEMP%\probe32\）：
+#   - abort() **确实同步**投递 finished()（5/5 次，三种状态下都成立）
+#     -> 注释的**前提**是对的；
+#   - 但预测的"空指针解引用**崩溃**"**没有复现**（nullptr->deleteLater()
+#     是 UB，而 QObject::deleteLater() 不解引用，侥幸活着）
+#     -> 注释描述的**具体后果过强了**；
+#   - 真正可观测的后果是**假错误**：
+#       正确顺序（先断连接+先摘成员）：finished 处理 0 次，错误信号 0 个
+#       错误顺序（直接 abort）        ：finished 处理 1 次，错误信号 1 个
+#       消息 = "天气请求失败: Operation canceled (HTTP 200)"
+#     -> 每次刷新取消在途请求，界面都会闪一条假错误。
+# 测试守的是最后这条真实差异，文本已按实测改写。
+#
+# 用**真实 QTcpServer** 当天气接口 + 真实事件循环，不 mock 网络、不调私有槽。
+# 通过 ACCESSTERMINAL_WEATHER_URL 把 AppConfig 指到该服务端。
+#
+# 链接真实的 weather_service.cpp 与 app_config.cpp（后者提供 URL 与解析）。
+# ---------------------------------------------------------------------------
+add_executable(desktop_test_weather_service
+    test_weather_service.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/core/weather/weather_service.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/config/app_config.cpp
+)
+
+target_include_directories(desktop_test_weather_service PRIVATE
+    ${ACCESSTERMINAL_SRC_ROOT}
+)
+
+target_link_libraries(desktop_test_weather_service PRIVATE
+    Qt5::Core
+    Qt5::Test
+    Qt5::Network
+)
+
+add_test(NAME desktop_weather_service COMMAND desktop_test_weather_service)

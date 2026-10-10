@@ -97,10 +97,11 @@ cmake --build /tmp/desktop-tests
 ctest --test-dir /tmp/desktop-tests --output-on-failure
 ```
 
-当前 4 个目标：`desktop_protocol`（协议编解码）、`desktop_app_config`
+当前 5 个目标：`desktop_protocol`（协议编解码）、`desktop_app_config`
 （配置与灯控指令解析）、`desktop_signaling_server`（TCP 8887 信令服务端，
 真实 socket 端到端）、`desktop_monitor_client`（**UDP 50000 远程预览客户端**，
-真实 socket + 环回别名假门口机，31 个用例）。
+真实 socket + 环回别名假门口机，31 个用例）、`desktop_weather_service`
+（**天气获取与文案格式化**，真实 QTcpServer 当天气接口，27 个用例）。
 
 > `tests/CMakeLists.txt` 此前缺 `cmake_minimum_required`/`project()`，独立构建
 > 会直接配置失败；补上之后又会因为缺 `enable_testing()` 而"构建成功、
@@ -302,7 +303,7 @@ bind、`newConnection`、`readyRead` 派发、`disconnected` 清理一并被验�
 
 ## 关键约定（由自动化检查强制）
 
-以下五十二条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+以下五十五条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
 `tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
 
 ### 1. 音视频通道只在接听后建立
@@ -822,33 +823,33 @@ a.write("l\n");            // 只有补上 A 自己的后半，才应出现 Call
 补上 gcov 度量后，第一个数字是 **93.6%**。把从未被链接的产线文件折进分母后，
 真实值是 **16.2%**。
 
-原因在**分母**：93.6% 只统计被链接进测试目标的文件。另有 **14 个产线源
-文件（约 1136 行）从未被任何测试目标链接**：
+原因在**分母**：93.6% 只统计被链接进测试目标的文件。另有 **13 个产线源
+文件（约 1046 行）从未被任何测试目标链接**：
 
 | 从未被任何测试链接的产线文件 | 说明 |
 | --- | --- |
 | `src/ui/widget.cpp` | 主窗口，最长的一个 |
 | `src/core/media/call_session.cpp` | 通话会话 |
-| `src/core/weather/weather_service.cpp` | 天气服务 |
 | `src/hal/serial_light.cpp` | 串口灯控 |
 | `src/ui/form_phonecall.cpp` | 通话界面 |
 | `src/ui/slidehintwidget.cpp` | 滑动提示控件 |
 | `src/main.cpp` 及其余头文件 | — |
 
-> `src/core/net/monitor_client.cpp` **第 31 轮已移出本表**：新增
-> `desktop_monitor_client` 目标后，它 318 行里覆盖 298 行，
-> 且"可达未测"降为 **0**（余下 3 行是 `qDebug` 文案等不可达点）。
+> 第 31、32 轮各移出一个：
+> `src/core/net/monitor_client.cpp`（新增 `desktop_monitor_client` 后
+> 318 行覆盖 298 行，"可达未测"降为 **0**）与
+> `src/core/weather/weather_service.cpp`（新增 `desktop_weather_service`）。
 
 `tools/run_coverage.sh` 一键产出：
 
 ```
-已测文件 318 行（覆盖 298）+ 未测文件约 1136 行 = 分母 1454
-近似总覆盖率 = 20.5%   （上表那个 93.7% 仅描述已测文件）
+已测文件 375 行（覆盖 357）+ 未测文件约 1046 行 = 分母 1421
+近似总覆盖率 = 25.1%   （上表那个 95.2% 仅描述已测文件）
 ```
 
 被测到的文件覆盖度本身不错：`src/core/net/signaling_server.cpp` 76/76 = 100%，
 `src/config/app_config.cpp` 100%，`src/core/net/monitor_client.cpp` 可达部分
-100%，合计 318 行中 298 行（93.7%）。
+100%，合计 375 行中 357 行（95.2%）。
 
 **数字正确、口径错误，比没有数字更危险** —— 它会让人停止寻找缺口。
 
@@ -1320,6 +1321,55 @@ m_socket.bind(QHostAddress("127.0.0.2"), 50000,
 只在体内查。这就是"守卫条件不得引用被守卫内容里也出现的字符串"那条规矩的
 一个具体形态：**整文件子串检查是最容易变成恒真的一类规则。**
 
+### 53. 给 `WeatherService` 补测试：一条写着"不能这样写"却从未被验证的注释
+
+第 32 轮给 `src/core/weather/weather_service.cpp` 补了 27 个用例
+（`tests/test_weather_service.cpp`）。它此前从未被任何测试目标链接。
+
+起因是它代码里最长的那段注释（`abandonReply()` 上方）断言的是一条
+**从未被验证过的因果链**。第 32 轮先用探针实测了这条链
+（`%TEMP%\probe32\`），结果**一半对、一半错**：
+
+| 实测 | 结论 |
+|---|---|
+| `result11.txt` | `abort()` **确实同步**投递 `finished()` —— 5/5 次，三种状态下都成立。**注释的前提是对的。** |
+| `result12.txt` | 但预测的"空指针解引用**崩溃**"**没有复现** —— `nullptr->deleteLater()` 形式上是 UB，可 `QObject::deleteLater()` 只是把指针丢进事件队列、并不解引用，程序**侥幸活着**。注**描述的具体后果过强了**。 |
+| `result13.txt` | 真正的、**用户可见**的后果是**假错误**：正确顺序 finished 处理 0 次/错误 0 个；错误顺序 finished 处理 1 次/错误 1 个，消息 `天气请求失败: Operation canceled (HTTP 200)`。 |
+
+也就是说：**每次刷新天气取消上一个在途请求，界面都会闪一条"天气请求失败"**，
+而实际上并没有失败。测试守的是这条真实差异
+（`refreshCancelsInFlightWithoutFalseError`），注释已按实测改写。
+
+> 教训：一句"这里有 UB/会崩溃"如果**没被验证过**，它既可能挡住一个真缺陷，
+> 也可能只是把 UB 说成了必然崩溃。**UB 不等于必然崩溃** —— 这个区别会
+> 影响后来者是"保留防御"还是"认定不可达而删掉它"。
+
+### 54. 测试用假服务端时，**按键必须在断开时就清干净**
+
+`FakeWeatherServer` 用裸指针当 `QMap` 的键记录"这条连接是否已应答"。
+第一版只在 `disconnected` 里删了 `m_buffers`，**漏删 `m_answered`**。
+socket 是 `deleteLater()` 释放的，堆地址被复用后，新建的 socket 很可能
+拿到同一个地址 —— `m_answered.contains(sock)` 命中旧记录，于是**永远不再
+应答**，客户端一直等到超时。
+
+表现是 **1/15 次偶发失败、单独跑又全过** —— 极容易被误判成"被测代码有竞态"。
+实测确认后修掉，`40/40` 次全量通过。
+
+> 附带教训（工具层面）：我第一次"验证修复"时跑的是**旧二进制**
+> （在修复前构建的目录里），于是看到"仍然 1/15 失败"并差点去改被测代码。
+> **验证一个修复必须用重新构建的产物** —— 否则你验证的是修改前的世界。
+
+### 55. 规则本身也可能**过强**，基线就不过
+
+`check_weather_service_contract_is_pinned` 第一版把顺序写死成
+`disconnect -> 摘成员 -> abort`，结果基线直接报错：真实代码是先
+`m_reply = nullptr;` 再 `disconnect(...)`。两者**相对次序并不重要**，
+真正不可调换的是"它们都在 `abort()` 之前"。改成 `i_disc < i_abort and
+i_null < i_abort` 之后才对。
+
+这是本规则自己的故障注入当场抓到的 —— **规则和被测代码一样需要证明**；
+一条基线就不过的规则如果被"顺手放宽到能过"，往往会把真正的约束也一起丢掉。
+
 ## 开发约定
 
 - **标准**：C++11
@@ -1366,6 +1416,8 @@ python3 tools/verify_signalspy_metatype.py .
 python3 tools/verify_dead_slot.py .
 python3 tools/verify_monitor_client_rule.py
 python3 tools/verify_monitor_client_test.py
+python3 tools/verify_weather_service_rule.py
+python3 tools/verify_weather_service_test.py
 bash tools/run_coverage.sh
 
 # 3. 跨仓库协议一致性

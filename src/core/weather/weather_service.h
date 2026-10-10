@@ -43,9 +43,9 @@ private:
 
     /**
      * 丢弃当前在途请求（断开信号 → 摘除成员 → abort/deleteLater）。
-     * 顺序不可调换：abort() 可能同步投递 finished()，若先 abort 会重入
-     * onFinished() 并把 m_reply 置空，随后对本函数内的 m_reply 解引用即为
-     * 空指针。详见 .cpp 中的说明。
+     * 顺序不可调换：abort() 会**同步**投递 finished()，若先 abort 会重入
+     * onFinished() 并把 m_reply 置空，让后续处理看到不一致的状态。
+     * 实测的可观测后果是**假 errorOccurred**（而非崩溃），详见 .cpp 中的说明。
      */
     void abandonReply();
 

@@ -3068,6 +3068,110 @@ def check_monitor_client_contract_is_pinned(root, src_root):
                      "还有一处同样的判断会顶包（第 31 轮故障注入实测）。")
 
 
+def check_weather_service_contract_is_pinned(root, src_root):
+    r"""
+    天气服务里有几处**行为测试抓不到**、但必须守住的契约，靠静态规则钉住。
+
+    背景：第 32 轮给 `weather_service.cpp` 补了 27 个用例（真实 QTcpServer +
+    真实事件循环）。故障注入过程中实测出两处**没有判别力**的地方，
+    如实记录并改由本规则守（而不是留在测试里假装守着）：
+
+      1. `abandonReply()` 里 `m_reply = nullptr;` 那一句。
+         实测：删掉它**测试仍然全绿**。原因是函数已经**先**把 finished 信号
+         断开了，abort() 那个同步 finished() 到不了 onFinished()，没有任何
+         代码会再读 m_reply；而唯一读它的地方（refresh/析构）都会立刻写它
+         或走向对象销毁 —— 悬挂窗口里没有可观测行为。
+         注意这与"不断开连接"是**两件事**：后者会走同步重入，是被抓到的
+         （`refreshCancelsInFlightWithoutFalseError` 会因假错误而失败）。
+
+      2. `~WeatherService()` 里对 `abandonReply()` 的调用。
+         实测：删掉它**测试仍然全绿**。因为 `QNetworkAccessManager` 是本类的
+         **子对象**（`new ... (this)`），而 `get()` 返回的 reply 又是 manager
+         的子对象，`~QObject` 会连带销毁它们，句柄一样被释放。
+         这与第 31 轮 `MonitorClient` 的"析构不调用 stop()"是同一类：
+         QObject 父子所有权让这条路径不可观测。（第 31 轮那条最终是靠
+         `activeChanged` 信号才变得可观测；`abandonReply()` 不发任何信号，
+         因此没有任何可观测痕迹。）
+
+    另外钉住那条**顺序契约**本身：`abandonReply()` 必须先 disconnect、再摘
+    成员、最后才 abort。顺序错了会同步重入并抛出假错误 —— 这是实测
+    （探针 result13.txt）确认过的用户可见缺陷，所以值得在源码文本上再守一道，
+    以防有人"简化"掉某一步。
+    """
+    ws = os.path.join(src_root, "core", "weather", "weather_service.cpp")
+    if not os.path.exists(ws):
+        return  # 本仓库没有该模块（例如门口机侧），规则安全通过
+    text = io.open(ws, encoding="utf-8", errors="replace").read()
+
+    body = _brace_matched_body(text, "void WeatherService::abandonReply()")
+    if body is None:
+        fail("[weather] 无法在 weather_service.cpp 里定位 "
+             "WeatherService::abandonReply() 的函数体（规则自身需要修复）。")
+        return
+
+    # ---- 顺序契约 ----
+    # 必须**两步都先于 abort()**：先 disconnect 掉 finished 信号，并把成员
+    # 摘到局部变量/置空。二者相对次序不重要（当前实现是先置空再 disconnect），
+    # 唯一不可调换的是：**它们都在 abort() 之前**。
+    #
+    # 用 index 比较而不是"整文件里出现过" —— 后者会被别处的相同片段顶包
+    # （这正是 _brace_matched_body 存在的原因，第 31 轮的教训）。
+    # 第一版把顺序写死成 "disconnect -> 摘成员 -> abort"，结果基线就报错：
+    # 真实代码是先 `m_reply = nullptr;` 再 `disconnect(...)`。规则**过强**了，
+    # 由本规则的故障注入当场抓到（又一个"先证明规则本身对"的实例）。
+    i_disc = body.find("disconnect(")
+    i_null = body.find("m_reply = nullptr")
+    i_abort = body.find("->abort()")
+    if i_disc < 0:
+        fail("[weather] abandonReply() 必须先 disconnect() 断开 finished 信号："
+             "否则 abort() 会**同步**重入 onFinished()（实测 5/5 次同步），"
+             "让它看到 OperationCanceledError 并 emit 一条假的 "
+             "errorOccurred（界面会闪『天气请求失败』而其实没失败）。")
+    elif i_null < 0:
+        fail("[weather] abandonReply() 必须把 m_reply 摘到局部变量并置空成员"
+             "（实测删掉它本测试抓不到，故只能在此守住；见函数文档）。")
+    elif i_abort < 0:
+        fail("[weather] abandonReply() 必须调用 reply->abort() 取消在途请求。")
+    elif not (i_disc < i_abort and i_null < i_abort):
+        fail("[weather] abandonReply() 里 disconnect() 与『摘成员 m_reply = "
+             "nullptr』都必须在 abort() **之前**完成（两者相对次序不限）。"
+             "abort() 会同步重入 onFinished()（实测），顺序错会产生假的 "
+             "errorOccurred。")
+
+    # ---- 析构必须丢弃在途请求（实测本测试抓不到，见函数文档）----
+    dtor = _brace_matched_body(text, "WeatherService::~WeatherService()")
+    if dtor is not None and "abandonReply()" not in dtor:
+        fail("[weather] ~WeatherService() 应当调用 abandonReply() 丢弃在途请求。"
+             "实测删掉它单元测试抓不到（QNetworkAccessManager 是子对象，"
+             "~QObject 会连带销毁在途 reply），因此只能靠这条规则守住。")
+
+    # ---- 文案格式：与重构前逐字符一致，且各字段不许接错 ----
+    # 这是用户**直接看到**的字符串，且基线有明确格式。
+    if "今日天气" not in text:
+        fail("[weather] 天气文案里应当保留『今日天气』（与重构前基线一致）。")
+    if "每日提醒：" not in text:
+        fail("[weather] 天气文案里应当保留『每日提醒：』前缀（与基线一致）。")
+    # .arg(city, type, high, low, wind, notice) 的**顺序**就是占位符顺序，
+    # 接错会导致"天气显示成了风向"这种荒唐结果而测试可能仍全绿
+    # （若测试期望串也照抄同一顺序的话）。这里按源码文本钉住顺序。
+    if ".arg(city, type, high, low, wind, notice)" not in text:
+        fail("[weather] 文案的 .arg(...) 实参顺序必须是 "
+             "(city, type, high, low, wind, notice)，与占位符 %1..%6 对应。")
+
+    # ---- 定制的网络/JSON 边界（用户可见的提示语，且是防越界的关键）----
+    for needle, why in (
+            ('if (url.isEmpty())',
+             "URL 为空时不应发起请求（基线行为）"),
+            ('forecast.isEmpty()',
+             "forecast 为空数组时必须提前返回，否则 forecast.at(0) 越界"),
+            ('if (!doc.isObject())',
+             "顶层不是 JSON 对象时必须报错，否则后续 toObject() 得到空对象"
+             "并静默产出空文案"),
+    ):
+        if needle not in text:
+            fail("[weather] weather_service.cpp 缺少 %s；%s。" % (needle, why))
+
+
 def check_cross_repo_test_targets_are_unique(root, extra_root):
     """
     两个仓库的测试目标名必须互不冲突，否则**超级工程无法配置**。
@@ -3170,6 +3274,7 @@ def main():
     check_face_gate_hazard_is_documented(root, src_root)
     check_fault_harnesses_classify_crashes_correctly(root, src_root)
     check_monitor_client_contract_is_pinned(root, src_root)
+    check_weather_service_contract_is_pinned(root, src_root)
     check_fake_fingerprint_builds_same_bytes(root, src_root)
     check_fingerprint_checksum_logic_is_not_duplicated(root, src_root)
     check_gated_wire_paths_have_resume_test(root, src_root)

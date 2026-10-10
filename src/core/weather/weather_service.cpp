@@ -47,16 +47,40 @@ void WeatherService::refresh()
  * 安全地丢弃当前在途请求。
  *
  * 不能直接写成 `m_reply->abort(); m_reply->deleteLater();`：QNetworkReply
- * 的 abort() 可能**同步**投递 finished()，从而在此处重入 onFinished()。
- * 而 onFinished() 的第一件事就是把成员 m_reply 置空、并对它调用
- * deleteLater()。于是回到本函数继续执行 `m_reply->deleteLater()` 时，
- * m_reply 已经是 nullptr —— 空指针解引用。
+ * 的 abort() 会**同步**投递 finished()，从而在此处重入 onFinished()；
+ * 而 onFinished() 的第一件事就是把成员 m_reply 置空。回到本函数继续执行时，
+ * m_reply 已经被改了。
  *
  * 因此顺序必须是：
  *   1. 先断开信号，杜绝任何重入；
  *   2. 把句柄从成员搬到局部变量，让 onFinished() 看到的状态始终一致；
  *   3. 再 abort()/deleteLater()。
  * 这样无论 abort() 是否同步发信号都安全。
+ *
+ * 第 32 轮实测校准（原先的描述**不够准确**，此处按实测改写）
+ * ------------------------------------------------------------------
+ * 原先这里写的是"随后 `m_reply->deleteLater()` 就是**空指针解引用**"。
+ * 探针实测（%TEMP%\probe32\）之后发现这句话一半对一半错：
+ *
+ *   实测 1（result11.txt）：`abort()` **确实同步**投递 finished() ——
+ *     5/5 次，且"尚未收到任何数据"、"已收响应头但 body 未完成"、"已
+ *     finished 之后"三种状态下都成立。**这段注释的前提是对的。**
+ *
+ *   实测 2（result12.txt）：但被预测的"空指针解引用**崩溃**"**没有复现**。
+ *     `nullptr->deleteLater()` 形式上确是 UB，可 `QObject::deleteLater()`
+ *     只是把指针丢进事件队列、并不解引用它，程序于是**侥幸活着**。
+ *     把"UB"说成"必然崩溃"是**过头**的，容易让后来者做出错误判断
+ *     （例如据此认为这条路径不可达，或反过来把防御删掉）。
+ *
+ *   实测 3（result13.txt）：真正的、**用户可见**的后果是**假错误**：
+ *       正确顺序（先断连接 + 先摘成员）：finished 处理 0 次，错误信号 0 个
+ *       错误顺序（直接 abort）        ：finished 处理 1 次，错误信号 1 个
+ *                                       消息 = "天气请求失败: Operation canceled (HTTP 200)"
+ *     同步重入让 onFinished() 看到 `error == OperationCanceledError`，于是
+ *     emit errorOccurred —— **每次刷新天气取消上一个在途请求，界面都会闪
+ *     一条"天气请求失败"**，而实际上并没有失败。
+ *     这才是本函数真正在挡的东西，也正是单元测试
+ *     `refreshCancelsInFlightWithoutFalseError` 所钉住的差异。
  */
 void WeatherService::abandonReply()
 {
