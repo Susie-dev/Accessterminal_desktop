@@ -301,7 +301,7 @@ bind、`newConnection`、`readyRead` 派发、`disconnected` 清理一并被验�
 
 ## 关键约定（由自动化检查强制）
 
-以下二十四条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+以下二十六条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
 `tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
 
 ### 1. 音视频通道只在接听后建立
@@ -789,6 +789,32 @@ a.write("l\n");            // 只有补上 A 自己的后半，才应出现 Call
 什么，也不要写一条看起来在防、实则永远为真的断言 —— 后者会让人误以为那块
 代码已经被验证过了。
 
+### 25. 有测试 ≠ 被测到：先确认被测代码在不在执行路径上
+
+门口机仓库第 21 轮给 `FingerprintManager::startEnroll()` 写了 26 个用例并
+全部通过，第 23 轮才发现它在整个工程里**没有任何调用者** —— 现场跑的是
+`Form_finger` 里另一套内联状态机。这是"有测试 ≠ 被测到"的升级版：不是断言
+没落在输出上，而是**被测对象根本不在执行路径上**。26 个绿灯与现场行为毫无
+关系，而且两份实现**并不等价**（现场那套多一轮 `GET_IMAGE` 探手指）。
+
+规则：为一个函数写测试之前，先确认它有生产调用者（或作为 connect 目标）。
+`check_declared_slot_is_reachable` 现在会对"既无调用者、也不是 connect 目标"
+的槽告警（本仓库无指纹代码，该规则为 no-op，同步是为了规则集对齐）。
+
+### 26. 无法用单元测试覆盖的产线路径，用静态契约检查钉住它的线上字节
+
+门口机的 `Form_finger` 内联注册流程无法用单元测试覆盖（UI 类，需
+`parentWidget()` 上溯到 `Widget` 才能拿到串口句柄，还要真实 `QTimer` 与
+提示音；造夹具比被测代码还复杂，且会**再造一份平行实现**——正是第 25 条要
+消除的问题）。
+
+但它的命令字节是**指纹模块的硬契约**，不能没人守。做法是静态抽取
+`append((char)…)` 的常量与 `readPacket(超时)`，与内置期望序列比对：
+`check_live_fingerprint_enroll_sequence_is_pinned`。
+
+这与"影响线上字节格式的协议常量必须被测试钉住"（第 17 条）是同一思路的
+延伸：**能用运行时测试就用运行时测试，不能用就用静态契约，但绝不能没人守**。
+
 ## 开发约定
 
 - **标准**：C++11
@@ -832,6 +858,7 @@ python3 tools/verify_nonblock_pcm.py .
 python3 tools/verify_gated_resume.py .
 python3 tools/verify_fp_ack_tag.py .
 python3 tools/verify_signalspy_metatype.py .
+python3 tools/verify_dead_slot.py .
 
 # 3. 跨仓库协议一致性
 python3 tools/check_protocol_sync.py

@@ -1996,6 +1996,224 @@ def check_signalspy_types_are_registered(root, src_root):
                  "replyWritesExactWireBytes 失败）。".format(rel, t, t))
 
 
+def check_declared_slot_is_reachable(root, src_root):
+    r"""
+    声明在 `slots:` 下、但既无调用者也不是 connect 目标的成员函数 = **不可达槽**。
+
+    背景（第 23 轮发现，baseline 同样存在，属继承死代码）：
+    `FingerprintManager::startEnroll(int)` 有完整实现、有守卫、有分步状态机，
+    第 21 轮我还为它写了 26 个单元测试 —— 但它在**整个工程里没有任何调用者**，
+    也不是任何 connect 的目标。现场真正跑的指纹注册是 `Form_finger` 里那套
+    **内联**状态机（`startFingerRegisterStep` + `doFingerCollect`），它直接
+    调 `buildPacket/sendPacket/readPacket`，完全绕过 `FingerprintManager`。
+
+    也就是说：那份测试覆盖的是**平行实现**，不是产线代码。这是
+    "有测试 ≠ 被测到" 的升级版 —— 不是测试没断言到输出，而是被测对象
+    根本不在执行路径上。
+
+    同类还有 `Widget::onFingerprintEnroll` / `Widget::onFingerprintIdentify`：
+    它们分别对应 `FingerprintManager::enrollResult` / `identifyResult`，
+    而 `identifyResult` 已被改成 lambda 连接、`enrollResult` 只在
+    `startEnroll` 里发射（那条路是死的），于是这两个槽永远不会被调用。
+
+    为什么只报 WARNING：
+      - 槽可能是**刻意保留的公开 API**（供未来接线或外部调用）；
+      - `on_<对象名>_<信号>()` 由 `connectSlotsByName` 自动接线，必须排除，
+        否则会把全部按钮槽误报成死代码；
+      - 判定是静态的，无法覆盖 `QMetaObject::invokeMethod` 按名调用，
+        也无法覆盖跨仓库（另一仓库可能调用本仓库的公开槽）。
+
+    判定：对每个 slots: 区声明的函数，
+      1. 若是 `on_<对象名>_<信号>` 命名，跳过（uic 自动接线）；
+      2. 若作为 connect 的第 2 或第 4 实参出现，跳过；
+      3. 若在任何 .cpp 里以 `name(` 出现，且**不是** `Cls::name(` 形式
+         （即不是定义行本身），算有调用者；
+      4. 三条都不满足 -> 告警。
+    """
+    import re as _re
+    slot_re = r'^\s*(?:(?:public|private|protected)\s+)?(?:slots|Q_SLOTS)\s*:'
+    sig_re = r'^\s*(?:(?:public|private|protected)\s+)?(?:signals|Q_SIGNALS)\s*:'
+    acc_re = r'^\s*(?:public|private|protected)\s*:'
+    mem_re = r'^(?:[\w:<>,\*&\s]+?\s)?~?(\w+)\s*\('
+
+    slots = {}
+    for hpath in find_files(src_root, {".h", ".hpp"}):
+        htext = strip_comments_and_strings(read(hpath))
+        for cm in _re.finditer(r'\bclass\s+(\w+)\s*(?::[^{;]*)?\{', htext):
+            cname = cm.group(1)
+            start = cm.end() - 1
+            depth, i = 0, start
+            while i < len(htext):
+                if htext[i] == "{":
+                    depth += 1
+                elif htext[i] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                i += 1
+            body = htext[start + 1:i]
+            if "Q_OBJECT" not in body:
+                continue
+            cur = False
+            for line in body.split("\n"):
+                if _re.match(slot_re, line):
+                    cur = True
+                    continue
+                if _re.match(sig_re, line) or _re.match(acc_re, line):
+                    cur = False
+                    continue
+                if cur:
+                    mm = _re.match(mem_re, line.strip())
+                    if mm:
+                        slots.setdefault((cname, mm.group(1)),
+                                         os.path.relpath(hpath, root))
+    if not slots:
+        return
+
+    texts = {}
+    for path in find_files(src_root, {".cpp"}):
+        texts[path] = strip_comments_and_strings(read(path))
+
+    # connect 目标：第 2 实参（信号）与第 4 实参（槽）
+    targets = set()
+    for path, text in texts.items():
+        for mm in _re.finditer(r'\bconnect\s*\(', text):
+            args = split_top_level_args(
+                enclosing_call_text(text, mm.end() - 1))
+            if len(args) >= 2:
+                lt = _re.findall(r'(\w+)', args[1])
+                if len(lt) >= 2:
+                    targets.add((lt[-2], lt[-1]))
+            if len(args) >= 4:
+                m4 = _re.search(r'&\s*(?:(\w+)::)?(\w+)\s*$', args[3].strip())
+                if m4:
+                    targets.add((m4.group(1), m4.group(2)))
+
+    auto_re = _re.compile(
+        r'^on_[A-Za-z0-9_]+_(clicked|toggled|pressed|released|'
+        r'textChanged|textEdited|valueChanged|currentIndexChanged|'
+        r'returnPressed|activated|editingFinished|stateChanged|'
+        r'currentTextChanged|highlighted|destroyed|triggered)$')
+
+    for (cname, slot), rel in sorted(slots.items()):
+        if (cname, slot) in targets or auto_re.match(slot):
+            continue
+        calls = 0
+        for path, text in texts.items():
+            for mm in _re.finditer(r'\b' + _re.escape(slot) + r'\s*\(', text):
+                ctx = text[max(0, mm.start() - 80):mm.start()]
+                # 定义行：以 "Cls::" 结尾
+                if _re.search(r'(^|[^\w])' + _re.escape(cname) + r'\s*::\s*$',
+                              ctx):
+                    continue
+                calls += 1
+        if calls == 0:
+            warn("[dead-slot] {}: 槽 {}::{}() 既无调用者、也不是任何 connect 的"
+                 "目标（已排除 uic 自动接线的 on_<对象>_<信号>）—— 它是**不可达"
+                 "代码**。为它写的单元测试覆盖的是平行实现、不是产线路径；"
+                 "改动它不会影响现场行为。第 23 轮实测："
+                 "FingerprintManager::startEnroll 就是如此（现场跑的是 "
+                 "Form_finger 的内联状态机）。若为刻意保留的公开 API，"
+                 "请在注释中说明。".format(rel, cname, slot))
+
+
+
+
+def check_live_fingerprint_enroll_sequence_is_pinned(root, src_root):
+    r"""
+    **产线真正走的**指纹注册路径的命令字节与超时必须被钉住。
+
+    背景（第 23 轮）：
+    指纹注册在工程里有**两份**实现：
+      A) `FingerprintManager::startEnroll(int)` —— 有测试、**无生产调用者**；
+      B) `Form_finger::startFingerRegisterStep()` + `doFingerCollect()`
+         —— 内联状态机，直接读写串口，**这才是现场执行的那条**。
+
+    两条并不等价：B 在每一步先由轮询定时器发一次 `CMD_GET_IMAGE` 探手指，
+    确认后再在 `doFingerCollect()` 里**再发一次** `CMD_GET_IMAGE` 才 `GEN_CHAR`；
+    A 只发一次。B 与 baseline 的 `form_finger.cpp` 逐字节一致（第 23 轮实测：
+    两处各 9 个 append、序列与超时完全相同），因此 B 才是必须守住的契约。
+
+    B 无法用单元测试覆盖：它是 UI 类，`startFingerRegisterStep` 需要经由
+    `parentWidget()` 上溯到 `Widget` 才能拿到 `fingerprint()`，还要真实的
+    `QTimer` 与提示音。为它造夹具比被测代码还复杂，且会引入新的"平行实现"。
+    因此改用**静态契约检查**把它的线上字节钉住 —— 与
+    `check_wire_format_constants_are_pinned` 同一思路。
+
+    判定：在 `form_finger.cpp` 里按源码顺序抽取
+      - `append((char)常量)` 的常量（变量如 `step`/`id >> 8` 归一为占位符）
+      - `readPacket(超时)`
+    与内置的期望序列逐一比较。序列变了就说明线上字节被改动过。
+    """
+    import re as _re
+    target_rel = os.path.join("src", "ui", "form_finger.cpp")
+    path = os.path.join(root, target_rel)
+    if not os.path.exists(path):
+        return
+    text = read(path)
+    # 去注释，避免注释里的 0x0N 干扰
+    text = _re.sub(r'/\*[\s\S]*?\*/', '', text)
+    text = _re.sub(r'//[^\n]*', '', text)
+
+    def func_body(s, sig):
+        try:
+            i = s.index(sig)
+        except ValueError:
+            return ""
+        j = s.index('{', i)
+        depth, k = 0, j
+        while k < len(s):
+            if s[k] == '{':
+                depth += 1
+            elif s[k] == '}':
+                depth -= 1
+                if depth == 0:
+                    break
+            k += 1
+        return s[j:k + 1]
+
+    def seq(body):
+        out = []
+        for m in _re.finditer(
+                r'append\s*\(\s*\(char\)\s*([^)]+?)\s*\)'
+                r'|readPacket\s*\(\s*(\d+)\s*\)', body):
+            if m.group(1) is not None:
+                v = " ".join(m.group(1).split())
+                # 变量归一为占位符（它们的取值在别的断言里管）
+                if not v.startswith("0x") and not v.isdigit():
+                    v = "<var>"
+                out.append("B:" + v)
+            else:
+                out.append("T:" + m.group(2))
+        return out
+
+    got = []
+    for sig in ('void Form_finger::startFingerRegisterStep(',
+                'void Form_finger::doFingerCollect('):
+        got += seq(func_body(text, sig))
+
+    # 期望序列（第 23 轮实测，与 baseline form_finger.cpp 逐字节一致）
+    #   轮询探手指 GET_IMAGE(500)
+    #   采集   GET_IMAGE(2000) -> GEN_CHAR(step)(2000)
+    #   合并   REG_MODEL(2000)
+    #   存储   STORE_CHAR(1,id_hi,id_lo)(2000)
+    want = [
+        "B:0x01", "T:500",
+        "B:0x01", "T:2000",
+        "B:0x02", "B:<var>", "T:2000",
+        "B:0x05", "T:2000",
+        "B:0x06", "B:1", "B:<var>", "B:<var>", "T:2000",
+    ]
+    if got != want:
+        fail("[fp-live-seq] {} 的指纹注册命令序列与钉住的契约不一致。\n"
+             "        期望: {}\n        实际: {}\n"
+             "        这是**产线真正执行**的注册路径（Form_finger 内联状态机，"
+             "不是 FingerprintManager::startEnroll —— 那条没有调用者）。"
+             "命令字节/超时是指纹模块的硬契约，改动后模块不会按预期响应。"
+             .format(target_rel, " ".join(want), " ".join(got)))
+
+
+
 def check_cross_repo_test_targets_are_unique(root, extra_root):
     """
     两个仓库的测试目标名必须互不冲突，否则**超级工程无法配置**。
@@ -2088,6 +2306,8 @@ def main():
     check_nonblock_pcm_handles_eagain(root, src_root)
     check_fingerprint_ack_tag_is_validated(root, src_root)
     check_signalspy_types_are_registered(root, src_root)
+    check_declared_slot_is_reachable(root, src_root)
+    check_live_fingerprint_enroll_sequence_is_pinned(root, src_root)
     check_gated_wire_paths_have_resume_test(root, src_root)
     check_cross_repo_test_targets_are_unique(
         root, sys.argv[2] if len(sys.argv) > 2 else None)
