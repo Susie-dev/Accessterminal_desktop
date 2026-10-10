@@ -53,6 +53,14 @@ cmake --build build -j
 ./build/bin/smartserver
 ```
 
+一键脚本（配置 + 编译 + 跑测试）：
+
+```sh
+bash tools/build_host.sh
+```
+
+产物在 `build-host/bin/smartserver`。
+
 ### 依赖
 
 - Qt5：`Core Gui Widgets Network Multimedia SerialPort`（≥ 5.12）
@@ -64,12 +72,33 @@ Debian / Ubuntu：
 sudo apt install qtbase5-dev qtmultimedia5-dev libqt5serialport5-dev cmake g++
 ```
 
+Windows（MSYS2 + MinGW-w64）：
+
+```sh
+pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja \
+          mingw-w64-x86_64-qt5-base mingw-w64-x86_64-qt5-multimedia \
+          mingw-w64-x86_64-qt5-serialport mingw-w64-x86_64-qt5-tools
+```
+
 ### 单元测试
 
 ```sh
 cmake -S . -B build -DACCESSTERMINAL_BUILD_TESTS=ON
 cmake --build build && ctest --test-dir build --output-on-failure
 ```
+
+### 已验证的构建环境
+
+本工程已做过真实的完整构建（编译 + 链接 + 单元测试通过）：
+
+| 项目 | 版本 |
+| --- | --- |
+| 编译器 | MinGW-w64 GCC 16.2.0 |
+| CMake | 4.4.4 |
+| Qt | 5.15.19 |
+| 平台 | Windows 10 + MSYS2 |
+
+结果：0 error、0 warning，`ctest` 1/1 通过。
 
 也保留了 qmake 工作流（Qt Creator 可直接打开 `smartserver.pro`）：
 
@@ -184,12 +213,23 @@ clang-format -i $(git ls-files '*.cpp' '*.h')
 ### 提交前自检
 
 ```sh
-# 1. 静态一致性（include 解析、构建列表、qrc、.ui 控件引用、旧标识符）
+# 1. 静态一致性（include 解析、构建列表、qrc、.ui 控件引用、旧标识符、
+#    前置声明一致性、JSON 配置）
 python3 tools/verify.py .
 
-# 2. 跨仓库协议一致性
+# 2. 签名一致性（.h 声明 vs .cpp 定义）
+python3 tools/check_signatures.py .
+
+# 3. 跨仓库协议一致性
 python3 tools/check_protocol_sync.py
+
+# 4. 真实编译（静态检查无法发现类型不匹配等问题，必须实际编译）
+bash tools/build_host.sh
 ```
+
+第 1~3 步是静态检查，速度快但覆盖有限；**第 4 步是必要的**——
+真实缺陷（如声明与定义返回类型不一致、模板无法接受 lambda、
+前置声明的类名拼错）只有编译器能发现。
 
 ---
 
