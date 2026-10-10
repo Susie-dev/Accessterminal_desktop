@@ -218,7 +218,7 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 
 ## 关键约定（由自动化检查强制）
 
-以下十八条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+以下二十条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
 `tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
 
 ### 1. 音视频通道只在接听后建立
@@ -581,7 +581,7 @@ ctest 用例名加仓库前缀（`desktop_` / `t113_`）后，超级工程 **5/5
 python3 tools/verify.py . ../Accessterminal_T113
 ```
 
-用 `.clang-format` 统一格式，但**格式不是正确性**——上述十八条请以
+用 `.clang-format` 统一格式，但**格式不是正确性**——上述二十条请以
 `verify.py` 的结果为准。
 
 
@@ -613,6 +613,42 @@ python3 tools/verify.py . ../Accessterminal_T113
 桌面端目前没有 ALSA 代码，该规则当前为空转；同步过来是为了将来加入播放逻辑时
 立刻生效，并且保证两个仓库的规则集合不漂移。
 
+### 19. 图像编码质量属于线上字节，必须被逐字节断言
+
+`QImage::save(&buffer, "JPEG", quality)` 的质量参数**不改变可解码性**，只改变
+字节。因此"质量被改动"是一类**静默的线上差异**：带宽与画质变了，接收端照样
+能解码，谁也不报错。
+
+只校验"是 JPEG 魔数 + 能解码"是**不够的**。对照实验证实：把通话视频的质量
+从 75 改成 1，原有测试**全部仍然通过**。
+
+正确做法是把收到的数据报与本地同一张图、同一个显式质量参数编码出的字节做
+**逐字节比较**，并补一条"换一个质量必须产生不同字节"的反向断言，证明该比较
+有区分度。注意期望值必须**显式写出质量数**（如 75），不能也用默认质量——
+那样比较会退化成"默认 == 默认"，完全不校验编码参数。
+
+> 附带澄清：Qt5 的**默认 JPEG 质量实测恰好等于 75**（遍历质量 1..100 逐一
+> 比对字节得出）。因此 `save(..., "JPEG")` 与 `save(..., "JPEG", 75)` 输出
+> 逐字节相同 —— 这个"看起来的参数差异"实际不存在，已固化为断言。
+
+### 20. 只写"停止"是不够的，必须断言"停止之后还能重新开始"
+
+状态机类代码里，`stop` 分支常有一行把状态置回初始值的赋值（如
+`CameraUdpServer::onReadyRead` 里 `stop` 分支的 `sending = false;`）。
+这行赋值对"停止"本身往往是**冗余**的 —— 实测去掉它，停止行为完全不变，
+线上字节一模一样，因此**任何只测"停止后不再发"的用例都发现不了它的缺失**。
+
+它真正的作用在**恢复**路径：若停止时没有复位，再次启动的条件判断
+（`if (!sending) sendTimer->start();`）就不成立，**第二次使用永远起不来**，
+而界面不报任何错。
+
+因此对"有开始/有停止"的通路，必须覆盖完整序列：
+**开始 -> 收到数据 -> 停止 -> 再次开始 -> 必须能再次收到数据**。
+
+该约定由 `check_gated_wire_paths_have_resume_test` 机械强制：它识别
+"`if (!X) { X = true; ... start(); }` + `X = false; ... stop();`" 形式的
+布尔闸门对，并要求 `tests/` 里出现"恢复"语义的用例或标记。
+自检见 `tools/verify_gated_resume.py`（5/5 用例）。
 ## 开发约定
 
 - **标准**：C++11
@@ -638,7 +674,8 @@ python3 tools/check_signatures.py .
 #     check_abandoned_async_tasks / check_subproject_cmake_is_selfcontained /
 #     check_hex_parse_is_validated / check_load_state_reset /
 #     check_wire_format_constants_are_pinned /
-#     check_nonblock_pcm_handles_eagain / check_narrowing_cast_of_config
+#     check_nonblock_pcm_handles_eagain /
+#     check_gated_wire_paths_have_resume_test / check_narrowing_cast_of_config
 #     做故障注入。静态规则写错会静默失效，必须证明它真能区分好坏代码。
 python3 tools/verify_config_sanity.py .
 python3 tools/verify_config_knobs.py .
@@ -651,6 +688,7 @@ python3 tools/verify_config_state.py .
 python3 tools/verify_cross_target.py .
 python3 tools/verify_wire_format.py .
 python3 tools/verify_nonblock_pcm.py .
+python3 tools/verify_gated_resume.py .
 
 # 3. 跨仓库协议一致性
 python3 tools/check_protocol_sync.py

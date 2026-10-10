@@ -1749,6 +1749,78 @@ def check_nonblock_pcm_handles_eagain(root, src_root):
                  .format(rel, fn))
 
 
+def check_gated_wire_paths_have_resume_test(root, src_root):
+    """
+    用布尔闸门控制推流的通路，必须测试"停止后能再次开始"。
+
+    背景（真实覆盖盲区，第 20 轮对照实验发现）：
+    `CameraUdpServer::onReadyRead` 的 stop 分支里有 `sending = false;`。
+    实测把它整行删掉后，**所有原有测试仍然通过** —— 因为"停止"由
+    `sendTimer->stop()` 独立完成，而 `sendFrame()` 开头的 `if (!sending) return;`
+    又使其线上不可见。也就是说这行赋值对"停止"是**冗余**的。
+
+    它真正的作用在**恢复**路径：若停止时没有把 sending 置回 false，
+    再次收到 `getframe` 时 `if (!sending) { sending = true; sendTimer->start(); }`
+    不成立，定时器不会重新启动，**第二次监看永远看不到画面**，而且不报任何错。
+
+    因此对"仅在请求后才工作、且可停止"的通路，测试必须覆盖完整序列：
+      开始 -> 收到数据 -> 停止 -> 再次开始 -> 必须能再次收到数据
+
+    判定（下限检查）：若某个源文件里同时存在
+      - 形如 `if (!X) { ... X = true; ... start(); }` 的闸门，且
+      - 形如 `X = false; ... stop();` 的停止分支，
+    则认为该通路有闸门；此时 tests/ 的源码里必须出现"恢复"语义的标记
+    （resume / reopened / restart / 恢复 等）。不要求精确匹配用例名，
+    但要求有人显式测过这条序列。
+    """
+    gate_files = []
+    for path in find_files(src_root, (".cpp", ".cc", ".cxx")):
+        text = strip_comments_and_strings(read(path))
+        # 闸门：if (!flag) { ... flag = true; ... .start(); }
+        for m in re.finditer(
+                r"if\s*\(\s*!\s*(\w+)\s*\)\s*\{[^{}]*?"
+                r"\b\1\s*=\s*true\b[^{}]*?\bstart\s*\(\s*\)\s*;",
+                text, re.S):
+            flag = m.group(1)
+            # 停止分支：`flag = false;` 之后不远处有 `stop()`。
+            # 注意不能用 `false\s*;[^;]*;[^;]*?stop` 这种写法 —— 它要求
+            # `sending = false;` 与 `stop()` 之间**再出现一个分号**，而实际
+            # 代码是紧邻的两条语句 `sending = false;\n sendTimer->stop();`
+            # （第二个分号在 stop() 之后），于是匹配数为 0，整条规则变成空转
+            # （自检里表现为"没有恢复语义"这一真阳性用例漏报）。
+            # 改用有界窗口即可。
+            if re.search(r"\b" + re.escape(flag) + r"\s*=\s*false\s*;"
+                         r"[\s\S]{0,120}?\bstop\s*\(\s*\)\s*;", text):
+                gate_files.append((os.path.relpath(path, root), flag))
+
+    if not gate_files:
+        return
+
+    tests_root = os.path.join(root, "tests")
+    if not os.path.isdir(tests_root):
+        fail("[gated-resume] 存在带闸门的推流通路，却找不到 tests 目录")
+        return
+    blob = "\n".join(strip_comments_and_strings(read(p))
+                     for p in find_files(tests_root, (".cpp", ".h", ".hpp", ".c")))
+    # 原始文本也要看：中文注释是常见写法，strip 会把注释清掉。
+    raw_blob = "\n".join(read(p)
+                         for p in find_files(tests_root, (".cpp", ".h", ".hpp", ".c")))
+
+    markers = ("resume", "Resume", "reopen", "Reopen", "restart", "Restart",
+               "恢复", "再次", "重新开始")
+    # 去掉注释后仍要能看出"再次开始"的语义
+    if any(mk in blob for mk in markers) or any(mk in raw_blob for mk in markers):
+        return
+
+    for rel, flag in gate_files:
+        fail("[gated-resume] {} 用布尔闸门 `{}` 控制推流（开始/停止各一处），"
+             "但 tests/ 里没有任何『停止后再次开始』的用例。"
+             "这类通路的停止分支常有一行把闸门置回初始值的赋值，它对"
+             "'停止'本身是冗余的、线上不可见，删掉后任何只测停止的用例都会通过；"
+             "而少了它，再次请求时条件判断不成立，第二次使用永远起不来且不报错。"
+             "请补一条 开始->停止->再次开始->能再次收到 的用例。".format(rel, flag))
+
+
 def check_cross_repo_test_targets_are_unique(root, extra_root):
     """
     两个仓库的测试目标名必须互不冲突，否则**超级工程无法配置**。
@@ -1839,6 +1911,7 @@ def main():
     check_narrowing_cast_of_config(root, src_root)
     check_wire_format_constants_are_pinned(root, src_root)
     check_nonblock_pcm_handles_eagain(root, src_root)
+    check_gated_wire_paths_have_resume_test(root, src_root)
     check_cross_repo_test_targets_are_unique(
         root, sys.argv[2] if len(sys.argv) > 2 else None)
 
