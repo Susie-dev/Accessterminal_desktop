@@ -41,3 +41,9 @@ smartserver
 Thumbs.db
 desktop.ini
 .DS_Store
+
+
+# ---- Python 工具脚本缓存（tools/ 下的校验脚本）----
+__pycache__/
+*.py[cod]
+.pytest_cache/

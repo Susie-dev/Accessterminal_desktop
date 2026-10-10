@@ -17,6 +17,13 @@ CMakeLists.txt text eol=lf
 *.json   text eol=lf
 *.md     text eol=lf
 *.txt    text eol=lf
+*.yml    text eol=lf
+*.yaml   text eol=lf
+*.py     text eol=lf
+*.rules  text eol=lf
+*.xml    text eol=lf
+# SysV init 脚本（无扩展名，按文件名匹配）
+accessterminal.init text eol=lf
 
 # 二进制资源：禁止任何换行符转换
 *.png    binary
@@ -32,9 +39,19 @@ CMakeLists.txt text eol=lf
 *.zip    binary
 *.so     binary
 *.a      binary
+*.o      binary
 
 # 二进制文件在 diff 中仅显示摘要
 *.png    -diff
 *.jpg    -diff
+*.jpeg   -diff
+*.gif    -diff
 *.wav    -diff
 *.pcm    -diff
+*.mp3    -diff
+*.onnx   -diff
+*.tar    -diff
+*.zip    -diff
+
+# Qt Designer 生成的 .ui 在 diff 中噪声较大，归档时视为可读文本
+*.ui     diff=qt

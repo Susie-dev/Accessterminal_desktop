@@ -1,0 +1,91 @@
+---
+# Accessterminal 项目统一代码风格
+#
+# 基于 LLVM 风格，按工程现状调整：4 空格缩进、Qt 命名习惯、
+# 中文注释不做换行限制。
+Language: Cpp
+BasedOnStyle: LLVM
+
+# 缩进
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+ContinuationIndentWidth: 4
+AccessModifierOffset: -4
+
+# 行宽：中文注释按显示宽度计算，放宽到 100。
+ColumnLimit: 100
+
+# 大括号：函数另起一行，控制语句同行（Qt 与主流 C++ 的常见写法）。
+BreakBeforeBraces: Custom
+BraceWrapping:
+  AfterClass: false
+  AfterControlStatement: false
+  AfterEnum: false
+  AfterFunction: true
+  AfterNamespace: false
+  AfterStruct: false
+  AfterUnion: false
+  BeforeCatch: false
+  BeforeElse: false
+  IndentBraces: false
+
+# 指针与引用贴近类型名：QString* ptr
+PointerAlignment: Left
+DerivePointerAlignment: false
+
+# 允许把简短函数体放在一行
+AllowShortFunctionsOnASingleLine: Inline
+AllowShortIfStatementsOnASingleLine: false
+AllowShortLoopsOnASingleLine: false
+AllowShortBlocksOnASingleLine: Empty
+
+# 命名空间内容不缩进，与 Qt 代码风格一致
+NamespaceIndentation: None
+
+# include 排序：头文件、本项目、Qt、系统
+SortIncludes: true
+IncludeBlocks: Regroup
+IncludeCategories:
+  # 本工程内部头文件（以 core/ config/ hal/ ui/ managers/ 开头）
+  - Regex: '^"(core|config|hal|ui|managers|app)/'
+    Priority: 2
+  # 同目录头文件
+  - Regex: '^"'
+    Priority: 1
+  # Qt 头文件
+  - Regex: '^<Q[A-Za-z]*>'
+    Priority: 3
+  # 其它系统头文件
+  - Regex: '^<'
+    Priority: 4
+
+# Qt 宏不应被当作普通语句处理
+ForEachMacros:
+  - foreach
+  - Q_FOREACH
+  - BOOST_FOREACH
+
+StatementMacros:
+  - Q_UNUSED
+  - QT_REQUIRE_VERSION
+
+# 对齐连续赋值与声明，读起来更整齐
+AlignConsecutiveAssignments: false
+AlignConsecutiveDeclarations: false
+AlignTrailingComments: true
+
+# 空格
+SpaceBeforeParens: ControlStatements
+SpaceInEmptyParentheses: false
+SpacesInAngles: false
+SpacesInContainerLiterals: false
+Cpp11BracedListStyle: true
+
+# 保持现有换行，避免大规模重排造成 diff 噪声
+ReflowComments: true
+MaxEmptyLinesToKeep: 2
+KeepEmptyLinesAtTheStartOfBlocks: false
+
+# 语言
+Standard: Cpp11

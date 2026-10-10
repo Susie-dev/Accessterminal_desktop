@@ -1,0 +1,34 @@
+# Accessterminal 项目统一编辑器约定
+# 与 .clang-format 保持一致；编辑器应优先读取本文件。
+
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 4
+max_line_length = 100
+
+# C/C++ 源文件
+[*.{c,cc,cpp,cxx,h,hpp,hxx}]
+indent_size = 4
+
+# 构建脚本与配置文件
+[*.{pro,pri,cmake,txt,json,yml,yaml,md}]
+indent_size = 2
+
+[Makefile]
+indent_style = tab
+
+# 资源文件与二进制不应做空白处理
+[*.{png,jpg,jpeg,gif,ico,pcm,wav,mp3,tar,zip,onnx}]
+insert_final_newline = false
+trim_trailing_whitespace = false
+
+# Qt Designer 生成的 .ui 保持原样，避免无意义 diff
+[*.ui]
+indent_size = 1
+trim_trailing_whitespace = false
