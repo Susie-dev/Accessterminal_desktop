@@ -1,0 +1,40 @@
+# 统一换行符策略：仓库内一律 LF，避免 Windows/Linux 往返污染
+# （嵌入式交叉编译环境为 Linux，CRLF 会进入源码并影响 shell 脚本）
+* text=auto eol=lf
+
+# 明确按文本处理的源码与脚本
+*.c      text eol=lf
+*.cpp    text eol=lf
+*.h      text eol=lf
+*.hpp    text eol=lf
+*.ui     text eol=lf
+*.qrc    text eol=lf
+*.pro    text eol=lf
+*.pri    text eol=lf
+*.cmake  text eol=lf
+CMakeLists.txt text eol=lf
+*.sh     text eol=lf
+*.json   text eol=lf
+*.md     text eol=lf
+*.txt    text eol=lf
+
+# 二进制资源：禁止任何换行符转换
+*.png    binary
+*.jpg    binary
+*.jpeg   binary
+*.gif    binary
+*.ico    binary
+*.mp3    binary
+*.wav    binary
+*.pcm    binary
+*.onnx   binary
+*.tar    binary
+*.zip    binary
+*.so     binary
+*.a      binary
+
+# 二进制文件在 diff 中仅显示摘要
+*.png    -diff
+*.jpg    -diff
+*.wav    -diff
+*.pcm    -diff

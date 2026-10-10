@@ -1,0 +1,32 @@
+<RCC>
+    <qresource prefix="/">
+        <file>pic/smartbg.png</file>
+        <file>pic/smart.png</file>
+        <file>pic/smarthover.png</file>
+        <file>pic/cam.png</file>
+        <file>pic/camhover.png</file>
+        <file>pic/off.png</file>
+        <file>pic/offhover.png</file>
+        <file>pic/set.png</file>
+        <file>pic/sethover.png</file>
+        <file>pic/wurao.png</file>
+        <file>pic/wuraohover.png</file>
+        <file>pic/rn.png</file>
+        <file>pic/rnhover.png</file>
+        <file>pic/markwurao.png</file>
+        <file>pic/hangup.png</file>
+        <file>door.mp3</file>
+        <file>pic/netlock.png</file>
+        <file>pic/netlockhover.png</file>
+        <file>pic/tea128.png</file>
+        <file>pic/cpu.png</file>
+        <file>pic/desk.png</file>
+        <file>pic/lightq.png</file>
+        <file>pic/she.png</file>
+        <file>pic/teas.png</file>
+        <file>pic/lhover.png</file>
+        <file>pic/li1.png</file>
+        <file>pic/li2.png</file>
+        <file>pic/li3.png</file>
+    </qresource>
+</RCC>
