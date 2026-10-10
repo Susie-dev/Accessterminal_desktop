@@ -2608,6 +2608,100 @@ def check_password_log_regression_is_enforced(root, src_root):
 
 
 
+def check_gpio_failure_paths_are_testable(root, src_root):
+    r"""
+    硬件封装（GpioLine）的“硬件出错”分支必须有**可编程假实现**覆盖。
+
+    背景（第 28 轮）
+    ---------------
+    `GpioLine` 管的是门口机**物理门锁/补光**那条线（PE5 = 线号 133，开锁与
+    补光共用，见 widget.cpp:224-226）。它此前从未被链接进任何测试目标，而它的
+    危险分支全在硬件出错上：打不开 chip / 拿不到线 / 请求失败 / 读失败。
+    处理错的后果是“该开门时不开”，或**请求泄漏把线占死**（下次开锁 EBUSY）。
+
+    真机 gpiochip 无法按需制造这些失败，开发机也没有 gpiochip，因此必须靠
+    可编程假实现。本轮补齐时夹具自造过两次假象，本规则把它们的结构性前提钉住：
+
+      1. 线号上限必须覆盖实际线号。第一版设每 chip 64 条，而工程用 132/133，
+         于是所有正常用例失败 —— 是夹具错了，不是生产代码。
+      2. 内存所有权必须对齐 libgpiod 1.x：线对象**由 chip 拥有**
+         （get_line 返回 chip 内部的数组元素），release 不释放内存、close 才
+         释放。第一版让两者各自 new/delete，于是生产代码在请求失败路径里先
+         release 再 close 时被误报成 release:unknown。
+
+    能力边界：形态检查，不能替代真跑（断言写反了看不出），
+    与 tools/verify_gpio_test.py 的故障注入互补。
+    """
+    src = os.path.join(src_root, "hal", "gpio.cpp")
+    if not os.path.exists(src):
+        return          # 本仓库没有 GPIO 封装，规则不适用
+
+    tests_dir = os.path.join(root, "tests")
+    hdr = os.path.join(tests_dir, "fake_gpiod.h")
+    impl = os.path.join(tests_dir, "fake_gpiod.cpp")
+    tf = os.path.join(tests_dir, "test_gpio.cpp")
+    cm = os.path.join(tests_dir, "CMakeLists.txt")
+
+    for p, why in ((hdr, "假 libgpiod 头文件"),
+                   (impl, "假 libgpiod 实现"),
+                   (tf, "GpioLine 测试")):
+        if not os.path.exists(p):
+            fail("[gpio-test] 缺少 " + os.path.basename(p) + "（" + why + "）。"
+                 "GpioLine 的硬件出错分支无法被执行 —— 真机 gpiochip 不能按需"
+                 "失败，开发机也没有 gpiochip，没有假实现这些分支就永远是死代码。")
+            return
+
+    if os.path.exists(cm):
+        c = read(cm)
+        for needle, why in (("test_gpio.cpp", "测试源文件未链接"),
+                            ("fake_gpiod.cpp", "假实现未链接"),
+                            ("hal/gpio.cpp", "被测的生产实现未链接")):
+            if needle not in c:
+                fail("[gpio-test] tests/CMakeLists.txt 缺少 " + needle
+                     + "（" + why + "）—— 写了但不会跑，等于没有。")
+
+    h = read(hdr)
+    i = read(impl)
+
+    # 现场度量：仍持有有效请求的线数。
+    if "busyLineCount" not in h or "busyLineCount" not in i:
+        fail("[gpio-test] 假 libgpiod 未提供 busyLineCount()。只数对象个数发现"
+             "不了**请求泄漏** —— 泄漏的请求会让线一直 busy，下次开锁直接 "
+             "EBUSY，这才是现场的故障度量。")
+
+    # 调用序列：断言“先 release 后 close”的前提。
+    if "callLog" not in h or "callLog" not in i:
+        fail("[gpio-test] 假 libgpiod 未记录调用序列（callLog）。只数次数发现"
+             "不了**释放顺序颠倒** —— 而 gpio.cpp 明确声明了先释放线、再关闭"
+             "chip 这一契约。")
+
+    # 线号上限必须覆盖工程实际线号。
+    if "kMaxLines" not in i:
+        fail("[gpio-test] 假 libgpiod 没有显式的线号上限（kMaxLines）。第一版"
+             "设成 64 而工程使用 132/133，导致所有正常用例失败 —— 那是夹具"
+             "自造的假象。必须显式声明并覆盖实际线号。")
+    else:
+        m = re.search(r"kMaxLines\s*=\s*(\d+)", i)
+        if not m or int(m.group(1)) < 1024:
+            fail("[gpio-test] 假 libgpiod 的线号上限过小（"
+                 + (m.group(1) if m else "未找到") + "），必须 >= 1024 才能覆盖"
+                 "工程实际使用的 PE4=132 / PE5=133。")
+
+    # 内存所有权模型。
+    if "requested" not in i or "ownerOf" not in i:
+        warn("[gpio-test] 假 libgpiod 未体现 libgpiod 1.x 的内存所有权模型"
+             "（线对象由 chip 拥有、release 只清请求状态）。若让 get_line 各自 "
+             "new、release 各自 delete，生产代码在请求失败路径里先 release 再 "
+             "close 会被误报成 release:unknown。")
+
+    # 故障注入夹具必须在。
+    fx = os.path.join(root, "tools", "verify_gpio_test.py")
+    if not os.path.exists(fx):
+        fail("[gpio-test] 缺少 tools/verify_gpio_test.py —— 没有故障注入就无法"
+             "证明这些资源生命周期断言**真的会失败**。不失败的回归测试没有价值。")
+
+
+
 def check_cross_repo_test_targets_are_unique(root, extra_root):
     """
     两个仓库的测试目标名必须互不冲突，否则**超级工程无法配置**。
@@ -2706,6 +2800,7 @@ def main():
     check_tool_scripts_are_console_encoding_safe(root, src_root)
     check_coverage_separates_dead_from_untested(root, src_root)
     check_password_log_regression_is_enforced(root, src_root)
+    check_gpio_failure_paths_are_testable(root, src_root)
     check_fake_fingerprint_builds_same_bytes(root, src_root)
     check_fingerprint_checksum_logic_is_not_duplicated(root, src_root)
     check_gated_wire_paths_have_resume_test(root, src_root)
