@@ -16,6 +16,8 @@
 import os
 import re
 import sys
+import io
+import tokenize
 import xml.etree.ElementTree as ET
 
 FAIL = []
@@ -2801,6 +2803,81 @@ def check_face_gate_hazard_is_documented(root, src_root):
 
 
 
+
+def check_fault_harnesses_classify_crashes_correctly(root, src_root):
+    r"""
+    故障注入夹具判断"崩溃"的方式必须是**实测**过的判据，不能靠猜。
+
+    背景（门口机侧第 30 轮实测，本规则据此同步）
+    -------------------------------------------
+    此前门口机侧多个夹具写成 `crashed = returncode not in (0, 1)`，并据此在
+    注释里声称"多数变异是被进程崩溃抓到的，那些变异真的造成了 double-free /
+    use-after-free"。第 30 轮实测推翻了这个说法：
+
+        "析构不释放（RAII 完全失效）" -> rc=18，**18 条 FAIL 行**
+        "请求输出失败时不释放线"       -> rc=1， 1 条 FAIL 行
+        "close() 不 munmap（只关 fd）" -> rc=22，**22 条 FAIL 行**
+
+    **QtTest 的退出码等于 FAIL 行数**，不是崩溃信号。于是
+    `returncode not in (0,1)` 把"多个用例干净失败"误标成了"崩溃"。
+
+    更危险的是它还有一个**假绿**方向：真正的崩溃若恰好 rc=1
+    （例如某些运行时错误的 1 号退出），会被判成"未抓到（假绿）"，
+    让一个有效的回归测试被误删 —— 删掉的正是保护你的东西。
+
+    正确判据：**真正的崩溃 = 非零退出码但一条 FAIL 行都没有**
+    （如 0xC0000005 访问违例）。
+
+    只看可执行代码：该模式会作为**字符串字面量**出现在故障注入夹具里
+    （夹具正是靠 replace 它来制造变异），只挖注释会把夹具本身误报出来；
+    CMake/注释里也会出现文件名。用 tokenize 挖掉注释与字符串。
+
+    本仓库当前没有此类夹具，规则会安全通过；它的价值是**将来不再踩这个坑**。
+    """
+    tools_dir = os.path.join(root, "tools")
+    if not os.path.isdir(tools_dir):
+        return
+
+    def code_only(path):
+        text = io.open(path, encoding="utf-8", errors="replace").read()
+        lines = text.split("\n")
+        try:
+            toks = list(tokenize.generate_tokens(io.StringIO(text).readline))
+        except (tokenize.TokenError, IndentationError, SyntaxError):
+            return text
+        drop = set()
+        for tok in toks:
+            if tok.type in (tokenize.COMMENT, tokenize.STRING):
+                for ln in range(tok.start[0], tok.end[0] + 1):
+                    drop.add(ln)
+        return "\n".join("" if i in drop else l
+                          for i, l in enumerate(lines, 1))
+
+    bad = []
+    for name in sorted(os.listdir(tools_dir)):
+        if not (name.startswith("verify_") and name.endswith(".py")):
+            continue
+        p = os.path.join(tools_dir, name)
+        # 不吞异常：曾因漏 import 被 `except Exception: continue` 静默吃掉，
+        # 整个规则成了恒真空操作。
+        text = code_only(p)
+        if re.search(r"returncode\s+not\s+in\s*\(\s*0\s*,\s*1\s*\)", text):
+            bad.append(name)
+            continue
+        if re.search(r"^\s*crashed\s*=", text, re.M) and \
+                "and not failed" not in text:
+            bad.append(name)
+
+    if bad:
+        fail("[harness-crash] 下列故障注入夹具用了**未经验证**的崩溃判据"
+             "（returncode not in (0,1) 之类）：" + "、".join(bad)
+             + "。实测 QtTest 的退出码**等于 FAIL 行数**"
+             "（析构不释放 -> rc=18 且 18 条 FAIL 行），因此那种判据会把"
+             "『多个用例干净失败』误标成『崩溃』；更糟的是真正的崩溃若恰好 "
+             "rc=1 会被判成『未抓到（假绿）』。正确判据是："
+             "crashed = returncode != 0 and not failed。")
+
+
 def check_cross_repo_test_targets_are_unique(root, extra_root):
     """
     两个仓库的测试目标名必须互不冲突，否则**超级工程无法配置**。
@@ -2901,6 +2978,7 @@ def main():
     check_password_log_regression_is_enforced(root, src_root)
     check_gpio_failure_paths_are_testable(root, src_root)
     check_face_gate_hazard_is_documented(root, src_root)
+    check_fault_harnesses_classify_crashes_correctly(root, src_root)
     check_fake_fingerprint_builds_same_bytes(root, src_root)
     check_fingerprint_checksum_logic_is_not_duplicated(root, src_root)
     check_gated_wire_paths_have_resume_test(root, src_root)
