@@ -31,7 +31,7 @@ set(CMAKE_AUTOMOC ON)
 # 独立构建时必须自己启用测试注册，否则 add_test() 不生效。
 enable_testing()
 
-find_package(Qt5 5.12 REQUIRED COMPONENTS Core Test)
+find_package(Qt5 5.12 REQUIRED COMPONENTS Core Test Network)
 
 # 作为子目录被主工程引入时 CMAKE_SOURCE_DIR 指向主工程根，src 在其下；
 # 独立构建时 CMAKE_SOURCE_DIR 就是 tests/，src 在上一级。两种都要能工作。
@@ -79,3 +79,34 @@ target_link_libraries(desktop_test_app_config PRIVATE
 )
 
 add_test(NAME desktop_app_config COMMAND desktop_test_app_config)
+
+# ---------------------------------------------------------------------------
+# SignalingServer：室内机 TCP 8887 信令服务端
+#
+# TCP 8887 是本项目**第一条协议硬约束**，但室内机侧的 SignalingServer
+# （接收门口机的 call/stopsend/unlock，回 accept/recstop/unlock）此前没有任何
+# 单元测试 —— 只有协议编解码被 test_protocol.cpp 覆盖，服务端自己的行为
+# （接入/断开、按连接分流的解码器、回执、广播、停止）全无覆盖。
+#
+# 本目标用**真实 QTcpSocket** 连到真实 QTcpServer 上，走完整事件循环：bind、
+# newConnection、readyRead 派发、disconnected 清理一并被验证，而不是直接调
+# 私有槽（那会绕开真正的线上路径）。不需要任何硬件。
+#
+# 不需要测试替身，因此直接链接真实的 signaling_server.cpp。
+# ---------------------------------------------------------------------------
+add_executable(desktop_test_signaling_server
+    test_signaling_server.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/core/net/signaling_server.cpp
+)
+
+target_include_directories(desktop_test_signaling_server PRIVATE
+    ${ACCESSTERMINAL_SRC_ROOT}
+)
+
+target_link_libraries(desktop_test_signaling_server PRIVATE
+    Qt5::Core
+    Qt5::Test
+    Qt5::Network
+)
+
+add_test(NAME desktop_signaling_server COMMAND desktop_test_signaling_server)

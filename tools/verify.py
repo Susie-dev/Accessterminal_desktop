@@ -1893,6 +1893,109 @@ def check_fingerprint_ack_tag_is_validated(root, src_root):
              "收紧判据会改变现场行为，需显式决策，故此处仅告警。"
              .format(rel, line, fname, var, var))
 
+
+
+def _norm_metatype(name):
+    r"""
+    把类型名规范化为"最后一段限定名 + 指针后缀"，用于跨命名空间比较。
+
+    为什么需要：测试文件顶部常有 `using namespace accessterminal;`，于是断言
+    写成 `value<protocol::Signal>()`，而注册写成
+    `qRegisterMetaType<accessterminal::protocol::Signal>()`。
+    两者是**同一个类型**，按字面比较会误报 —— 我在真实仓库上实测到了这一点。
+
+      protocol::Signal                    -> Signal
+      accessterminal::protocol::Signal    -> Signal
+      QTcpSocket*                         -> QTcpSocket*
+      QList<int>                          -> QList<int>   （保持原样）
+
+    局限：若两个不同命名空间的同名类型同时在一个文件里被使用，会漏报。
+    对当前仓库不成立，且本规则是告警级启发式，接受此局限。
+    """
+    t = " ".join(str(name).split())
+    stars = "*" if t.endswith("*") else ""
+    base = t.rstrip("*").strip()
+    base = base.split("::")[-1].strip()
+    return base + stars
+
+
+def check_signalspy_types_are_registered(root, src_root):
+    r"""
+    测试用 QSignalSpy 断言自定义类型时，必须显式 qRegisterMetaType。
+
+    背景（第 22 轮实测，非推测）：
+    `Q_DECLARE_METATYPE` 只让 `QVariant::value<T>()` **编译**通过；跨越队列
+    投递传递自定义类型还需要**运行时注册**，否则 Qt 打印
+    "Cannot queue arguments of type ..." 并把参数丢成默认构造值 ——
+    spy 里拿到的是 Unknown / nullptr，断言失败的样子**像被测代码的 bug**。
+
+    实测边界（逐项变异确认，不可笼统概括）：
+      - 只去掉 Signal 的注册   -> 只有 receivesExactWireBytes 失败；
+      - 只去掉 QTcpSocket* 注册 -> 只有 replyWritesExactWireBytes 失败；
+      - 两个都去掉             -> 两条都失败。
+    所以规则按**类型**分别判定，而不是"用了 QSignalSpy 就要求统一注册"。
+
+    判定：从 `value<T>()` 这种断言落点里抽出模板实参 T，若 T 不是 Qt 内建
+    类型，则该文件必须出现 `qRegisterMetaType<T>`。
+
+    为什么从"用法"抽而不是"先枚举类型名再反查"：第一版用
+    `[A-Z]\w*(?:::[A-Z]\w*)+` 枚举限定名，它要求**首段大写**，于是
+    `accessterminal::protocol::Signal`（首段小写）整个漏掉了 —— 真阳性用例
+    只报出 1 项却期望 2 项，被自检当场抓住。
+    """
+    import re as _re
+    tests_root = os.path.join(root, "tests")
+    if not os.path.isdir(tests_root):
+        return
+
+    # Qt 内建类型不必注册（已在 Qt 元类型系统里）。
+    builtin = {
+        "int", "bool", "double", "float", "char", "short", "long",
+        "uint", "ushort", "ulong", "qint8", "qint16", "qint32", "qint64",
+        "quint8", "quint16", "quint32", "quint64", "QString", "QVariant",
+        "QByteArray", "QDateTime", "QDate", "QTime", "QPoint", "QPointF",
+        "QSize", "QSizeF", "QRect", "QRectF", "QLine", "QLineF", "QUrl",
+        "QChar", "QLocale", "QRegExp", "QRegularExpression", "QStringList",
+        "QVariantList", "QVariantMap", "QVariantHash", "QBitArray",
+        "unsigned int", "unsigned char", "unsigned short", "unsigned long",
+    }
+
+    for path in find_files(tests_root, {".cpp"}):
+        text = read(path)
+        if "QSignalSpy" not in text:
+            continue
+        rel = os.path.relpath(path, root)
+        stripped = strip_comments_and_strings(text)
+
+        # 从断言落点抽取类型：value<T>() 的 T。
+        # 允许 T 里带 *、限定名、模板参数（如 QList<int>）。
+        wanted = set()
+        for m in _re.finditer(r'value\s*<\s*([^<>;{}]+?)\s*>\s*\(', stripped):
+            t = " ".join(m.group(1).split())
+            if not t:
+                continue
+            base = t.rstrip("*").strip()
+            if base in builtin:
+                continue
+            wanted.add(t)
+
+        # 注册处收集到的类型，按"规范化名"比较 —— 见下方 norm() 的说明。
+        registered = set()
+        for m in _re.finditer(r'qRegisterMetaType\s*<\s*([^<>;{}]+?)\s*>',
+                              stripped):
+            registered.add(_norm_metatype(m.group(1)))
+
+        for t in sorted(wanted):
+            if _norm_metatype(t) in registered:
+                continue
+            fail("[signalspy-metatype] {} 用 QSignalSpy 断言自定义类型 {}，"
+                 "但没有 qRegisterMetaType<{}>()。Q_DECLARE_METATYPE 只保证"
+                 "编译通过，跨队列投递还需运行时注册；否则参数会被丢成默认值，"
+                 "断言失败的样子像被测代码的 bug（第 22 轮实测：缺 Signal 注册"
+                 "只让 receivesExactWireBytes 失败；缺 QTcpSocket* 注册只让"
+                 "replyWritesExactWireBytes 失败）。".format(rel, t, t))
+
+
 def check_cross_repo_test_targets_are_unique(root, extra_root):
     """
     两个仓库的测试目标名必须互不冲突，否则**超级工程无法配置**。
@@ -1984,6 +2087,7 @@ def main():
     check_wire_format_constants_are_pinned(root, src_root)
     check_nonblock_pcm_handles_eagain(root, src_root)
     check_fingerprint_ack_tag_is_validated(root, src_root)
+    check_signalspy_types_are_registered(root, src_root)
     check_gated_wire_paths_have_resume_test(root, src_root)
     check_cross_repo_test_targets_are_unique(
         root, sys.argv[2] if len(sys.argv) > 2 else None)

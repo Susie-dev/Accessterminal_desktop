@@ -97,6 +97,10 @@ cmake --build /tmp/desktop-tests
 ctest --test-dir /tmp/desktop-tests --output-on-failure
 ```
 
+当前 3 个目标：`desktop_protocol`（协议编解码）、`desktop_app_config`
+（配置与灯控指令解析）、`desktop_signaling_server`（TCP 8887 信令服务端，
+真实 socket 端到端）。
+
 > `tests/CMakeLists.txt` 此前缺 `cmake_minimum_required`/`project()`，独立构建
 > 会直接配置失败；补上之后又会因为缺 `enable_testing()` 而"构建成功、
 > `ctest` 一个用例都不跑"。这类失败**只看构建退出码会被误判为通过**。现由
@@ -214,11 +218,90 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 | `getframe` | 室内机 → 门口机 | 开始推帧 |
 | `stop` | 室内机 → 门口机 | 停止推帧 |
 
+### 信令服务端（SignalingServer / TCP 8887）的行为断言
+
+TCP 8887 是本项目**第一条协议硬约束**，但室内机侧的 `SignalingServer`
+（接收门口机的 `call`/`stopsend`/`unlock`，并回 `accept`/`recstop`/`unlock`）
+此前**没有任何单元测试**：只有协议编解码被 `test_protocol.cpp` 覆盖，服务端
+自己的行为（接入/断开、按连接分流的解码器、回执、广播、停止）全无覆盖。
+
+测试方式是**真实 `QTcpSocket` 连到真实 `QTcpServer`**，走完整事件循环：
+bind、`newConnection`、`readyRead` 派发、`disconnected` 清理一并被验证，
+而不是直接调私有槽（那会绕开真正的线上路径）。不需要任何硬件。
+
+| 用例 | 钉住的行为 |
+| --- | --- |
+| `listenIsIdempotent` | 重复 `listen()` 幂等，不重复绑定 |
+| `listenOnBusyPortFailsAndEmits` | 端口被占用时返回 false 并发 `errorOccurred` |
+| `stopClosesListener` | `stop()` 后不再监听 |
+| `clientConnect/DisconnectEmitsSignal` | 接入/断开各自发信号 |
+| `receivesExactWireBytes` | `call`/`unlock`/`stopsend` 逐字节还原成枚举 |
+| `multipleSignalsInOneWriteAreAllDecoded` | 一次 write 含多条信令（粘包）必须全部解出 |
+| `splitSignalIsReassembled` | 被 TCP 拆成两包的信令必须拼出（半包不得丢） |
+| `stopsendSplitAtAmbiguousPrefixIsNotMisdecoded` | `"stop"`+`"send\n"` **不得**被误判为 `stop` |
+| `bareStopIsDecodedAsStop` | 裸 `stop\n`（远程监看停止）能立即定论 |
+| `legacyRecstopWithoutNewlineIsAccepted` | 裸 `recstop`（**无 `\n`**）仍被识别（baseline 宽容语义） |
+| `unknownTextIsIgnored` / `emptyLineIsIgnored` | 无法识别的文本/空行被忽略，之后仍正常 |
+| `whitespaceIsTrimmed` | 前后空白被 trim 后识别 |
+| `replyWritesExactWireBytes` | 回执逐字节为 `accept\n`/`recstop\n`/`unlock\n` |
+| `replyRejectsInvalidSocket` / `replyRejectsUnknownSignal` | 空指针、未连接、未知信令均被拒绝 |
+| `broadcastReachesAllClients` | 广播到全部已连接客户端并返回条数 |
+| `broadcastRejectsUnknownSignal` / `broadcastWithNoClientsReturnsZero` | 未知信令发 0 字节；无客户端返回 0 |
+| `decodersArePerConnection` | 两条连接的半包**不得串味**（解码器按 socket 分开） |
+| `decoderIsClearedOnDisconnect` | 断开后清解码器（**不具区分度**，见下） |
+| `disconnectOfOneClientDoesNotAffectOther` | 一条断开不影响另一条 |
+| `protocolConstantsAreFrozen` | 8887、`\n`、七条信令的字节形态、`Unknown` 产生**空帧** |
+| `allPortsAreDistinct` | 8887/12345/23456/50000 四个端口互不重复 |
+
+> `QSignalSpy` 断言自定义类型前**必须** `qRegisterMetaType`：
+> `Q_DECLARE_METATYPE` 只保证编译通过，跨队列投递还需运行时注册，否则参数被
+> 丢成默认值（`Unknown` / `nullptr`），断言失败的样子**像被测代码的 bug**。
+> 实测：只去掉 `Signal` 注册 → 只有 `receivesExactWireBytes` 失败；只去掉
+> `QTcpSocket*` 注册 → 只有 `replyWritesExactWireBytes` 失败。现由
+> `check_signalspy_types_are_registered` 强制，自检见
+> `tools/verify_signalspy_metatype.py`（4/4）。
+
+#### 对照实验：8 个变异体，7 个被抓，1 个如实记录
+
+变异体都是"看起来合理但错误"的实现改动。结果：
+
+| 变异 | 结果 |
+| --- | --- |
+| M1 回执用 `toWire` 而非 `frame`（漏 `\n`） | 被抓 |
+| M2 `broadcast` 不校验 `Unknown`（照发空帧） | 被抓 |
+| M3 `stop()` 不关闭监听 | 被抓 |
+| M4 所有连接共用**一个**解码器 | 被抓（**首版测试抓不到**，见下） |
+| M5 断开时不清解码器 | **仍通过** —— 只泄漏不损坏，见下 |
+| M6 断开时不发 `clientDisconnected` | 被抓 |
+| M7 接入时不发 `clientConnected` | 被抓 |
+| M8 `listen` 失败时不发 `errorOccurred` | 被抓 |
+
+**M4 暴露了首版测试的空转断言。** `decodersArePerConnection` 首版只断言
+"最终出现了一条 `Call`"——而共用解码器**恰好也能产生一条** `Call`
+（A 的前半 + B 的后半拼起来）。测试于是照样通过。真正的断言必须是
+**"在错误的那一侧发生之前，什么都还没出现"**：在 A 补上自己后半**之前**
+断言 `spy.count() == 0`。补上后 M4 立刻被抓。这条经验即第 23 条约定。
+
+**M5 是一个"只泄漏、不损坏"的缺陷，无法构造失败场景。** 删掉
+`onClientDisconnected()` 里的 `m_decoders.remove(client);` 后测试仍通过。
+原因是 `deleteLater()` 之后新连接拿到的是**全新的 `QTcpSocket` 对象**，
+其 `QHash` 键与旧的**不同**，陈旧条目根本不会被命中 —— 它只是让映射表
+无限增长（**泄漏**），不会造成串味。
+
+为确认这一点我另写了真实探针（8 次"连接-断开-重连"，观察
+`nextPendingConnection()` 返回的指针值）：**8 次得到 8 个互不相同的指针**，
+未观察到地址复用。因此当前无法复现失败。
+
+保留该行 `remove()` 与那条用例（一旦分配器真的复用了地址，串味会发生且极难
+定位），但在测试里**如实标注"不具区分度"**，而不是写一个看起来在防这件事、
+实则空转的断言。这条经验即第 24 条约定。
+
+
 ---
 
 ## 关键约定（由自动化检查强制）
 
-以下二十二条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+以下二十四条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
 `tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
 
 ### 1. 音视频通道只在接听后建立
@@ -673,6 +756,39 @@ startIdentify()` 里它在建定时器**之前**就发出"请按下指纹"的提
 互不相同且非零**，否则应视为断言无效。同理，夹具里的函数名/宏名要**恰好**
 匹配被测规则的匹配模式（本轮另有 `startTimer()` 不匹配 `\bstart\s*\(`
 的实例，只因仓库里恰好存在真实文件才没暴露）。
+### 23. 断言"最终出现了什么"是不够的，还要断言"在错误的一侧发生之前什么都没出现"
+
+`decodersArePerConnection` 首版只断言"最终出现了一条 `Call`"。而"所有连接
+共用同一个解码器"这个 bug **恰好也能产生一条** `Call`（A 连接的前半 + B 连接
+的后半拼起来），于是测试照样通过 —— 断言形式没错，却完全没有区分度。
+
+正确写法是在**错误的那一侧动作之前**插入一个否定断言：
+
+```cpp
+a.write("cal");  b.write("l\n");
+QTest::qWait(300);
+QCOMPARE(spy.count(), 0);   // ← 这一条才真正有区分度
+a.write("l\n");            // 只有补上 A 自己的后半，才应出现 Call
+```
+
+推广：任何"多方各自持有状态"的逻辑（按连接/按线程/按设备的映射），
+都要断言"**串味不会发生**"，而不只是"正确的那种情况最终能成功"。
+第 22 轮的对照实验（M4）正是这样抓到首版测试的空转断言。
+
+### 24. 无法构造失败场景的防御性代码，如实标注"不具区分度"，不要写空转断言
+
+`SignalingServer::onClientDisconnected()` 里的 `m_decoders.remove(client);`
+在对照实验（M5）中删掉后测试**照样通过**。深查后确认它守的是一个**只泄漏、
+不损坏**的问题：`deleteLater()` 之后新连接拿到的是全新 `QTcpSocket` 对象，
+`QHash` 键不同，陈旧条目不会被命中，只是让映射表增长。另用真实探针实测
+8 次连接-断开-重连得到 8 个互不相同的指针，未观察到地址复用，因此无法构造
+可复现的失败场景。
+
+处理方式：**保留代码与用例**（防御纵深 / 一旦分配器复用地址就会出问题），
+但在用例里明确写下"本用例不具区分度"及其原因。宁可让读者知道这条断言守不住
+什么，也不要写一条看起来在防、实则永远为真的断言 —— 后者会让人误以为那块
+代码已经被验证过了。
+
 ## 开发约定
 
 - **标准**：C++11
@@ -715,6 +831,7 @@ python3 tools/verify_wire_format.py .
 python3 tools/verify_nonblock_pcm.py .
 python3 tools/verify_gated_resume.py .
 python3 tools/verify_fp_ack_tag.py .
+python3 tools/verify_signalspy_metatype.py .
 
 # 3. 跨仓库协议一致性
 python3 tools/check_protocol_sync.py
