@@ -7,8 +7,10 @@ check_live_fingerprint_enroll_sequence_is_pinned：失败级
 import importlib.util
 import os
 import shutil
+import stat
 import sys
 import tempfile
+import time
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 VERIFY = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else \
@@ -24,6 +26,31 @@ def load():
     m = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(m)
     return m
+
+
+def _force_rmtree(path):
+    """删除目录树，遇到只读文件先改权限再删。
+
+    为什么需要：仓库里有 deploy/vendor 下的只读资源（如 thd.tar），
+    shutil.rmtree 在 Windows 上会因权限失败而**静默留下整个沙箱目录** ——
+    本轮开发中因脚本崩溃累积了 22 个残留沙箱（每个都含完整仓库副本，
+    数百 MB）。清理失败必须被重试且不可无声。
+    """
+    def onerr(func, p, exc):
+        try:
+            os.chmod(p, stat.S_IWRITE | stat.S_IREAD)
+            func(p)
+        except Exception:
+            pass
+    for _ in range(3):
+        if not os.path.exists(path):
+            return
+        shutil.rmtree(path, onerror=onerr)
+        if not os.path.exists(path):
+            return
+        time.sleep(0.3)
+    if os.path.exists(path):
+        print("  警告: 沙箱目录未能删除: " + path)
 
 
 def sandbox(mutate=None):
@@ -68,7 +95,7 @@ def case(name, kind, mutate, expect_min, expect_exact=None, requires=None):
             for x in hits[:2]:
                 print("        -> " + x[:120])
     finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+        _force_rmtree(tmp)
 
 
 def del_file(rel):
