@@ -2702,6 +2702,105 @@ def check_gpio_failure_paths_are_testable(root, src_root):
 
 
 
+def check_face_gate_hazard_is_documented(root, src_root):
+    r"""
+    人脸门禁的隐患必须被测试**显式钉住**，且"唯一判据"这一事实不能丢失。
+
+    背景（第 29 轮）
+    ---------------
+    FaceManager 决定**门开不开**（widget.cpp:889 检出人脸后调用 recognize()，
+    recognizeResult 决定是否开门）。它此前从未被链接进任何测试目标。
+
+    写断言前先做了临时探针，量到三条决定性事实：
+
+      1. 模型未训练时 predict() 抛 cv::Exception
+         （"This LBPH model is not computed yet"）。而 recognize() 的守卫是
+         `registeredFaces.size() < collectTarget` —— 数**样本数**，不是
+         "模型已训练"。两者在"填满样本但跳过 train()"时不相等，此时异常会
+         从 UI 线程的槽里逃出事件循环，直接终止进程。
+         当前不可达（唯一调用点 widget.cpp:767-768 填满即 train()），
+         但属**隐患**：一旦有人加了别的调用路径就会爆。
+      2. **单 label 时 `predictedLabel == 1` 恒为真**（训练 labels 全是 1），
+         因此 `confidence < threshold` 是**门禁的唯一判据**。
+      3. 我原本怀疑的"越界裁剪 -> 空样本 -> train 抛异常"链**不成立**
+         （实测 QImage::copy() 传越界矩形不返回空图），该猜测已被推翻。
+
+    本规则钉住：
+      - 门禁测试存在且接进构建；
+      - "唯一判据"这条断言存在（丢了它，门禁安全就没人守）；
+      - 上述隐患被测试**显式**记录（丢了它，隐患会静默变成缺陷）；
+      - 故障注入夹具存在（不失败的回归测试没有价值）；
+      - 阈值无范围约束 -> warn（安全相关，见下）。
+
+    关于阈值的 warn
+    ---------------
+    探针证实门禁安全**完全取决于**该阈值，而它只被读取、**没有任何范围
+    约束**（app_config.cpp 里 qBound/clamp 调用总数为 0）。配置成 1e9 会让
+    任何陌生人像都判"通过"，门锁形同虚设。这不是崩溃类缺陷，故只告警；
+    是否加约束属行为变化，需要单独决定。
+    """
+    impl = os.path.join(src_root, "managers", "face_manager.cpp")
+    if not os.path.exists(impl):
+        return          # 本仓库没有 FaceManager，规则不适用
+
+    tests_dir = os.path.join(root, "tests")
+    tf = os.path.join(tests_dir, "test_face_manager.cpp")
+    cm = os.path.join(tests_dir, "CMakeLists.txt")
+    fx = os.path.join(root, "tools", "verify_face_manager_test.py")
+
+    if not os.path.exists(tf):
+        fail("[face-gate] 缺少 tests/test_face_manager.cpp。FaceManager 决定门开"
+             "不开，而它此前从未被链接进任何测试目标 —— 探针已证实未训练的 "
+             "LBPH predict() 会抛 cv::Exception，异常逃出 UI 事件循环即终止进程。")
+        return
+
+    if os.path.exists(cm):
+        c = read(cm)
+        for needle, why in (("test_face_manager.cpp", "测试源文件未链接"),
+                            ("managers/face_manager.cpp", "被测的生产实现未链接")):
+            if needle not in c:
+                fail("[face-gate] tests/CMakeLists.txt 缺少 " + needle
+                     + "（" + why + "）—— 写了但不会跑，等于没有。")
+
+    t = read(tf)
+
+    # "唯一判据"这条断言必须存在。
+    # 用词元边界而非子串：改名成 "...SingleLabel_removed()" 会躲过子串检查，
+    # 因为原名是改后名的前缀（故障注入实测抓到了这一点）。
+    if "thresholdIsTheOnlyGateWithSingleLabel(" not in t:
+        fail("[face-gate] 门禁测试里没有『阈值是唯一判据』的断言。探针已证实"
+             "单 label 时 predictedLabel == 1 恒为真，因此 confidence < "
+             "threshold 是**唯一的门**；丢了这条断言，门禁安全就没人守。")
+
+    # 隐患必须被显式记录，而不是被默默"修好"。
+    # 同上：要求**完整符号名**，改短名即消失。
+    if "samplesWithoutTrainingMakeRecognizeThrow_documentedHazard" not in t:
+        fail("[face-gate] 门禁测试没有记录『样本填满但未训练时 recognize() 抛"
+             "异常』这一隐患。该路径当前不可达（widget.cpp 填满即 train()），"
+             "但一旦有人加了别的调用路径就会终止进程。必须显式钉住现状，"
+             "使『是否改为检查模型训练状态』成为一个显式决定。")
+
+    if not os.path.exists(fx):
+        fail("[face-gate] 缺少 tools/verify_face_manager_test.py —— 没有故障注入"
+             "就无法证明这些门禁断言**真的会失败**。不失败的回归测试没有价值。")
+
+    # 阈值没有范围约束 -> 告警（安全相关，但属行为变化，需单独决定）。
+    cfg = os.path.join(src_root, "config", "app_config.cpp")
+    if os.path.exists(cfg):
+        ctext = read(cfg)
+        if "faceConfidenceThreshold" in ctext:
+            clamped = re.search(
+                r"qBound|std::clamp|std::min|std::max|qMax|qMin", ctext)
+            if not clamped:
+                warn("[face-gate] behavior.face_confidence_threshold 没有任何范围"
+                     "约束，而探针证实**门禁安全完全取决于它**（单 label 时"
+                     "predictedLabel == 1 恒真）。配置成 1e9 会让任何陌生人像都"
+                     "判『通过』，门锁形同虚设；误配置成 900（少写一个 0）会"
+                     "静默失去门禁作用。是否加约束属行为变化，需单独决定 —— "
+                     "当前仅告警。")
+
+
+
 def check_cross_repo_test_targets_are_unique(root, extra_root):
     """
     两个仓库的测试目标名必须互不冲突，否则**超级工程无法配置**。
@@ -2801,6 +2900,7 @@ def main():
     check_coverage_separates_dead_from_untested(root, src_root)
     check_password_log_regression_is_enforced(root, src_root)
     check_gpio_failure_paths_are_testable(root, src_root)
+    check_face_gate_hazard_is_documented(root, src_root)
     check_fake_fingerprint_builds_same_bytes(root, src_root)
     check_fingerprint_checksum_logic_is_not_duplicated(root, src_root)
     check_gated_wire_paths_have_resume_test(root, src_root)
