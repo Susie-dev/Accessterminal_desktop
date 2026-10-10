@@ -202,7 +202,7 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 
 ## 关键约定（由自动化检查强制）
 
-以下几条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+以下六条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
 `tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
 
 ### 1. 音视频通道只在接听后建立
@@ -225,7 +225,8 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 并提供在退出/析构时调用的停止方法；分步之间的 `singleShot` 还要用代数令牌
 作废（避免退出后又被延时回调拉起来）。
 由 `check_unqueued_poll_timers` 强制。该检查**只覆盖 QWidget 子类**——
-随程序存活的 QObject 其常驻轮询是设计意图，不算缺陷。
+随程序存活的 QObject 其常驻轮询是设计意图，不算“界面空转”类缺陷。
+但这类轮询器**仍然必须持有句柄**，理由见第 6 条（设备互斥）。
 
 ### 4. 收 UDP 包必须检查 `readDatagram()` / `recvfrom()` 的返回值
 
@@ -285,7 +286,38 @@ QObject::connect: signal not found in <类名>
 `signals:` / `slots:` / 访问权限分区，若 `&Cls::name` 中的 `name` 在该类的
 非 `signals` 区被显式声明，即报错。继承自 Qt 基类的信号不予判定。
 
-用 `.clang-format` 统一格式，但**格式不是正确性**——上述五条请以
+### 6. 共用同一硬件的轮询器必须能被他方暂停
+
+若一个周期性 `QTimer` 的回调里做的是**阻塞式读设备**（串口 `readPacket`、
+`waitForReadyRead`、`waitForBytesWritten` 等），它就会和任何其他同样访问
+该设备的流程互相抢读应答——两边的读操作互为对方之应答源，结果是
+“偶发失败”但找不到原因。
+
+要互斥，前提是**拿得到定时器句柄**（才能暂停它）。因此这类轮询器不能写成
+局部变量：
+
+```cpp
+QTimer* timer = new QTimer(this);        // 局部：外部拿不到句柄，无法暂停
+connect(timer, &QTimer::timeout, this, [=]() mutable {
+    port->sendPacket(pkt);
+    QByteArray resp = port->readPacket(500);   // 阻塞读
+});
+timer->start(500);
+```
+
+请改为成员句柄，并提供 `setSuspended()` / `stop()` 之类的入口。
+另外，函数内 `static` 标志位（如 `static bool waitingFinger`）为所有实例
+共享且不随实例销毁复位，应改为成员变量；只对 lambda 可见的可变计数器
+不要用裸 `new`（成功路径才 `delete`，早退即泄漏），改用
+`QSharedPointer<T>` 按值捕获。
+
+由 `check_blocking_poll_has_handle` 强制。它与第 3 条互补：第 3 条只覆盖
+「QWidget 子类、`close()` 后界面空转」，本条覆盖其余常驻轮询器的
+**设备互斥**需求。门口机（T113）的 `FingerprintManager` 就真实存在这个问题
+（常驻识别与指纹注册抢同一个串口），本工程当前无该形态代码，本条为
+预防性对称检查。
+
+用 `.clang-format` 统一格式，但**格式不是正确性**——上述六条请以
 `verify.py` 的结果为准。
 
 ---

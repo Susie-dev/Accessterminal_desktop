@@ -426,6 +426,11 @@ def check_unqueued_poll_timers(root, src_root):
     QObject，其“等待手指”轮询本来就是设计上的常驻行为（识别流程结束时
     才 stop），并非缺陷。只有「承载它的界面可能先消失」时才构成问题。
     单次触发（singleShot / setSingleShot(true)）也会自己结束，不在范围内。
+
+    注意：门口机（T113）另有一条互补规则 check_blocking_poll_has_handle()，
+    覆盖“非 QWidget / 不会 close() 的常驻轮询器也必须持有句柄”的情形——
+    不是为了防空转，而是为了能与其他共用同一硬件资源的流程互斥。
+    本工程当前没有该形态的代码，为保持两端规则一致而同样注册了这条检查。
     """
     for path in find_files(src_root, {".cpp"}):
         text = strip_comments_and_strings(read(path))
@@ -463,6 +468,98 @@ def check_unqueued_poll_timers(root, src_root):
                  "该类会 close()（窗口被隐藏但对象仍存活，未设 WA_DeleteOnClose 时"
                  "尤其如此），定时器会在 GUI 线程上永久空转。"
                  "请改为成员变量并提供停止入口。"
+                 .format(rel, line, var))
+
+
+def check_blocking_poll_has_handle(root, src_root):
+    """
+    任何「周期性定时器 + 阻塞式读串口/读 socket」的轮询器，句柄必须是类成员。
+
+    背景（真实缺陷，来自门口机 baseline，本轮修复）：
+
+        void FingerprintManager::startIdentify()
+        {
+            QTimer* timer = new QTimer(this);    // 局部变量，无成员句柄
+            connect(timer, &QTimer::timeout, this, [=]() mutable {
+                fingerprint->sendPacket(pkt);
+                QByteArray resp = fingerprint->readPacket(500);  // 阻塞读
+                ...
+            });
+            timer->start(500);
+        }
+
+    为什么这是缺陷：识别轮询与注册流程读写的是**同一个串口**，
+
+        识别轮询：  send(CMD_GET_IMAGE) → readPacket(500)   ← 抢应答
+        注册流程：  send(CMD_GET_IMAGE) → readPacket(2000)  ← 抢应答
+
+    两者互为对方之应答源：识别轮询会把注册流程正在等待的应答从串口缓冲里
+    取走，注册流程拿到空字节数组，判为“采集图像失败”静默返回；反之亦然。
+    要互斥就必须能**暂停识别轮询**，而暂停的前提是拿得到句柄。此外阻塞读
+    跑在 GUI 线程上，每 500ms 会冻结界面一次。
+
+    判定规则：在 .cpp 中找到被 start(...) 周期化的 QTimer，若其创建点是
+    局部变量（非 m_xxx 成员、未放入容器、未 setSingleShot(true)），且回调
+    体内出现阻塞读调用，则报错。要求改为成员句柄并给出停止/暂停入口。
+
+    与 check_unqueued_poll_timers() 互补：后者只覆盖「继承 QWidget 且会
+    close()」的类（防界面隐藏后定时器空转）；本规则覆盖其余常驻轮询器
+    （防无法与共用同一硬件的流程互斥）。本工程当前无该形态代码，本条为
+    预防性对称检查，与门口机保持一致。
+    """
+    blocking = (
+        "readPacket", "waitForReadyRead", "waitForBytesWritten",
+        "waitForDisconnected", "waitForConnected",
+    )
+    for path in find_files(src_root, {".cpp"}):
+        text = strip_comments_and_strings(read(path))
+        rel = os.path.relpath(path, root)
+        if "new QTimer" not in text:
+            continue
+
+        header = path[:-4] + ".h"
+        if not os.path.isfile(header):
+            continue
+        htext = strip_comments_and_strings(read(header))
+        members = set(re.findall(r'\b(m_\w+)\s*(?:=|;|\))', htext))
+
+        for m in re.finditer(r'\bQTimer\s*\*\s*(\w+)\s*=\s*new\s+QTimer\b', text):
+            var = m.group(1)
+            if not re.search(re.escape(var) + r'\s*->\s*start\s*\(', text):
+                continue
+            if var in members:
+                continue
+            if re.search(r'\b\w+\s*(?:\.append|<<)\s*\(\s*' + re.escape(var), text):
+                continue
+            if re.search(re.escape(var) + r'\s*->\s*setSingleShot\s*\(\s*true\s*\)',
+                         text):
+                continue
+
+            conn = re.search(re.escape(var) + r'\s*,\s*&QTimer::timeout', text)
+            if not conn:
+                continue
+            body = text[conn.end():conn.end() + 4000]
+            depth = 0
+            started = False
+            end = len(body)
+            for i, ch in enumerate(body):
+                if ch == '{':
+                    depth += 1
+                    started = True
+                elif ch == '}':
+                    depth -= 1
+                    if started and depth == 0:
+                        end = i
+                        break
+            body = body[:end]
+            if not any(b in body for b in blocking):
+                continue
+
+            line = text.count("\n", 0, m.start()) + 1
+            fail("[poll-handle] {}:{} 周期性定时器 '{}' 的回调里有阻塞读（每轮会冻结"
+                 "调用线程一次），却没有成员句柄保存它 → 外部无法暂停/停止。"
+                 "若该轮询与其他流程共用同一设备（如串口），对方将与之互相抢读应答。"
+                 "请改为成员变量并提供 setSuspended()/stop 入口。"
                  .format(rel, line, var))
 
 
@@ -732,6 +829,7 @@ def main():
     check_media_gated_by_answer(root, src_root)
     check_deleted_on_close_members(root, src_root)
     check_unqueued_poll_timers(root, src_root)
+    check_blocking_poll_has_handle(root, src_root)
     check_datagram_read_returns(root, src_root)
     check_connect_signal_is_signal(root, src_root)
     check_json_configs(root)
