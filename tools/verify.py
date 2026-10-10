@@ -252,6 +252,44 @@ def check_qt5_portability(root, src_root):
                 fail(f"[cxx11] {rel} 使用了 {desc}，本工程为 C++11")
 
 
+def check_forward_declarations(root, src_root):
+    """
+    前置声明一致性检查。
+
+    背景（真实缺陷，曾在 T113 侧出现）：重构后 widget.h 里前置声明的
+    类名与工程实际定义的类名不一致（如声明 VideoPushThread，实际定义
+    CameraPushThread）。前置声明本身不报错，直到 .cpp 里 new/调用成员
+    才报 "invalid use of incomplete type"，报错位置离根因很远，容易被
+    误判成缺少 include。这里提前静态拦截。
+    """
+    candidates = {}
+    for path in find_files(src_root, {".h", ".cpp"}):
+        text = strip_comments_and_strings(read(path))
+        for m in re.finditer(r'^\s*class\s+([A-Za-z_]\w*)\s*;', text, re.M):
+            name = m.group(1)
+            if re.search(r'\b(?:class|struct)\s+' + re.escape(name) +
+                         r'\b[^;{]*\{', text):
+                continue
+            candidates.setdefault(name, []).append(os.path.relpath(path, root))
+
+    defined = set()
+    for path in find_files(src_root, {".h", ".cpp"}):
+        text = strip_comments_and_strings(read(path))
+        for m in re.finditer(r'\b(?:class|struct)\s+([A-Za-z_]\w*)\b\s*(?::[^;{]*)?\{',
+                             text):
+            defined.add(m.group(1))
+
+    for name, where in sorted(candidates.items()):
+        if name in defined:
+            continue
+        if name.startswith('Q') or name.startswith('Ui') or name in (
+                'timeval', 'sockaddr', 'sockaddr_in'):
+            continue
+        fail("[fwd] {} 前置声明了未在本工程定义的类型 '{}'；"
+             "若这是一个真实使用的成员类型，编译期会报 incomplete type"
+             .format(', '.join(sorted(set(where))), name))
+
+
 def check_json_configs(root):
     """配置文件必须是合法 JSON，且字段类型正确。"""
     import json
@@ -307,6 +345,7 @@ def main():
     check_balance(root, src_root)
     check_legacy_identifiers(root, src_root)
     check_qt5_portability(root, src_root)
+    check_forward_declarations(root, src_root)
     check_json_configs(root)
 
     print(f"校验目录: {root}")
