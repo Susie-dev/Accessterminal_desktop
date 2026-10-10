@@ -1,0 +1,2 @@
+# Accessterminal_desktop
+这是一个部署在X86上的Ubuntu上的ui应用，作为室内机与室外的门禁系统进行通信
