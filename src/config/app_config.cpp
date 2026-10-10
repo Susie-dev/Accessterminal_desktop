@@ -39,7 +39,49 @@ int jsonInt(const QJsonObject& obj, const QString& key, int fallback)
     return v.isDouble() ? v.toInt() : fallback;
 }
 
+/**
+ * @brief 判断整串是否只由十六进制字符组成。
+ *
+ * 为什么必须自己逐字符校验，而不能指望 QByteArray::fromHex 报错：
+ *
+ * fromHex() **不会**因为遇到非法字符而返回空 —— 它会**跳过**非法字符，把
+ * 剩下的合法字符**重新两两配对**。已在本机用真实 Qt 5.15.19 实测确认：
+ *
+ *   输入 "FD0G4C12045DDF"(14, 偶数) -> 0f d0 4c 12 04 5d df   （7 字节，全错）
+ *   输入 "FD03Z412045DDF"(14, 偶数) -> 0f d0 34 12 04 5d df   （7 字节，全错）
+ *   输入 "XX034C12045DDF"(14, 偶数) ->    03 4c 12 04 5d df   （6 字节，错位）
+ *   输入 "FD034C12045DDZ"(14, 偶数) -> 0f d0 34 c1 20 45 dd   （7 字节，错位）
+ *
+ * 即：只要字符数恰好是偶数，解码**总是"成功"**，只是内容面目全非。于是
+ * `!bytes.isEmpty()` 这道守卫完全拦不住，一条写错的灯控指令会被原样发给
+ * 串口，灯只表现为"没反应"，排查时极易怀疑硬件。
+ *
+ * 注意 "FD0G…" 这类**偶数字符数**的输入恰恰是最容易写出的错法（把某一位
+ * 敲成字母），所以这不是理论问题。
+ */
+bool isHexOnly(const QString& text)
+{
+    if (text.isEmpty()) {
+        return false;
+    }
+    for (int i = 0; i < text.size(); ++i) {
+        const QChar c = text.at(i);
+        const bool ok = (c >= QChar('0') && c <= QChar('9')) ||
+                        (c >= QChar('a') && c <= QChar('f')) ||
+                        (c >= QChar('A') && c <= QChar('F'));
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /// 将 "FD 03 4C 12 04 5D DF" 或 "FD034C12045DDF" 解析为字节序列。
+///
+/// 任一条件不满足即返回空 QByteArray，由调用方告警并保留默认值：
+///   - 清洗后为空；
+///   - 清洗后长度为奇数（半字节对不齐）；
+///   - 含有非十六进制字符（**必须显式检查**，理由见 isHexOnly 注释）。
 QByteArray parseHexBytes(const QString& text)
 {
     QString compact = text;
@@ -48,6 +90,10 @@ QByteArray parseHexBytes(const QString& text)
     compact.remove(QChar(':'));
     compact.remove(QStringLiteral("0x"), Qt::CaseInsensitive);
     if (compact.isEmpty() || compact.size() % 2 != 0) {
+        return QByteArray();
+    }
+    // 关键：fromHex 会静默跳过非法字符并重新配对，因此必须显式拒绝。
+    if (!isHexOnly(compact)) {
         return QByteArray();
     }
     return QByteArray::fromHex(compact.toLatin1());

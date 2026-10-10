@@ -1331,6 +1331,103 @@ def check_abandoned_async_tasks(root, src_root):
                  .format(rel, line, fm.group(2), "/".join(sorted(set(assigned)))))
 
 
+def check_hex_parse_is_validated(root, src_root):
+    """
+    `QByteArray::fromHex()` 的输入必须先逐字符校验为纯十六进制。
+
+    背景（真实缺陷，本轮修复）：
+    `parseHexBytes()` 原来只检查"清洗后非空"与"长度为偶数"就调用 fromHex。
+
+    而 fromHex() **不会**因非法字符而失败 —— 它**跳过**非法字符，把剩下的
+    合法字符**重新两两配对**。已用真实 Qt 5.15.19 实测确认（见
+    tests/test_app_config.cpp 中的可执行断言）：
+
+        "FD0G4C12045DDF" (14, 偶数) -> 0f d0 4c 12 04 5d df   （内容全错）
+        "XX034C12045DDF" (14, 偶数) ->    03 4c 12 04 5d df   （错位，少一字节）
+
+    于是只要字符数是偶数，解码总是"成功"，`!bytes.isEmpty()` 完全拦不住，
+    一条写错的灯控指令会被原样写进串口，灯只表现为"没反应"。
+
+    判定规则：若某函数把**变量**（而非字符串字面量）传给 fromHex，且该函数
+    体内没有显式的十六进制字符校验（isHexOnly 之类的调用，或逐字符比较
+    '0'~'9'/'a'~'f'/'A'~'F'），即报错。
+
+    传给 fromHex 的**字面量**（如 applyDefaults() 里的
+    `QByteArray::fromHex("FD034C12045DDF")`）不受影响：字面量的合法性由
+    人眼与测试保证。本工程当前唯一的变量用法是 parseHexBytes()。
+    """
+    # 显式校验的形态。两点约束来自故障注入自检：
+    #  1. strip_comments_and_strings() 会把字符字面量清空（'0' -> ''），
+    #     所以**不能**用 QChar('0') / c >= '0' 这类基于字符字面量的模式。
+    #  2. 不能只写死少数几个函数名，否则换个名字（如 validateHexOnly）就
+    #     漏判；这里用"名字里含 hex 的校验型函数调用"这一宽模式。
+    hexcheck_re = re.compile(
+        r"\b\w*(?:is|check|validate|verify|ensure|assert)\w*hex\w*\s*\("
+        r"|\b\w*hex\w*(?:is|check|validate|verify|only|ok|valid)\w*\s*\("
+        r"|\bisxdigit\b", re.I)
+    for path in find_files(src_root, {".cpp"}):
+        text = strip_comments_and_strings(read(path))
+        rel = os.path.relpath(path, root)
+        if "fromHex" not in text:
+            continue
+        # 同时覆盖 "Class::method(...)" 与**自由函数** "ret name(...)"。
+        # 真实缺陷就在匿名命名空间里的自由函数 parseHexBytes()，若只匹配
+        # Class::method 便完全漏判 —— 这正是本检查首版自检抓出来的问题。
+        funcs = list(re.finditer(
+            r'^[^\n{};#]*?\b(\w+)\s*\([^;{}]*\)\s*(?:const\s*)?\{',
+            text, re.M))
+        for fm in funcs:
+            if fm.group(1) in ("if", "while", "for", "switch", "catch",
+                               "else", "do", "return"):
+                continue
+            start = fm.end() - 1
+            depth, i = 0, start
+            while i < len(text):
+                if text[i] == '{':
+                    depth += 1
+                elif text[i] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        break
+                i += 1
+            body = text[start:i + 1]
+            if "fromHex" not in body:
+                continue
+            if hexcheck_re.search(body):
+                continue
+            # 提取 fromHex 的实参时**必须按括号配平扫描**，不能用
+            # `fromHex\s*\(([^()]*)\)`：真实写法是
+            #     QByteArray::fromHex(compact.toLatin1())
+            # 实参里含有嵌套括号 `toLatin1()`，`[^()]*` 根本匹配不到右括号，
+            # 于是整个 fromHex 调用被静默跳过、缺陷漏判。
+            # （本检查首版正是如此，靠故障注入自检才暴露。）
+            for m in re.finditer(r"fromHex\s*\(", body):
+                open_idx = m.end() - 1
+                depth, j = 0, open_idx
+                while j < len(body):
+                    if body[j] == '(':
+                        depth += 1
+                    elif body[j] == ')':
+                        depth -= 1
+                        if depth == 0:
+                            break
+                    j += 1
+                arg = body[open_idx + 1:j].strip()
+                if not arg:
+                    continue
+                # 字面量：内容由代码显式写出，不判定
+                if arg.startswith('"'):
+                    continue
+                line = text.count("\n", 0, fm.start()) + 1
+                fail("[hex-parse] {}:{} {}() 把变量 \"{}\" 直接传给 "
+                     "QByteArray::fromHex 而未先校验其为纯十六进制。"
+                     "fromHex 遇到非法字符不会报错，而是跳过非法字符并把剩余"
+                     "字符重新配对——偶数长度下总是\"成功\"、内容全错，"
+                     "`!bytes.isEmpty()` 拦不住。请先用逐字符校验"
+                     "（如 isHexOnly）拒绝含非十六进制字符的输入。"
+                     .format(rel, line, fm.group(1), arg[:40]))
+
+
 def main():
     if len(sys.argv) < 2:
         print("用法: python verify.py <项目根目录>")
@@ -1361,6 +1458,7 @@ def main():
     check_config_knobs_are_used(root, src_root)
     check_declared_signal_is_emitted(root, src_root)
     check_abandoned_async_tasks(root, src_root)
+    check_hex_parse_is_validated(root, src_root)
 
     print(f"校验目录: {root}")
     print("=" * 70)
