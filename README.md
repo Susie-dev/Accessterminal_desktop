@@ -202,7 +202,7 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 
 ## 关键约定（由自动化检查强制）
 
-以下十条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+以下十一条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
 `tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
 
 ### 1. 音视频通道只在接听后建立
@@ -422,7 +422,35 @@ connect**——既不报错也不提示。
 配对，`->` 与 `>>` 不计数。由 `tools/verify_connect_signal.py`
 （5/5 用例，含“首实参含 `->` 且第二实参是槽”的真阳性）锁定。
 
-用 `.clang-format` 统一格式，但**格式不是正确性**——上述十条请以
+### 11. 异步播放任务必须全部等待，不能只留最后一个
+
+门口机的 `AudioManager::playAsync()` 每次播放都覆盖同一个成员：
+
+```cpp
+stop();                                     // 置旧标志
+interruptFlag = std::make_shared<std::atomic<bool>>(false);
+playFuture = QtConcurrent::run([=]() { ... 捕获 this ... });
+```
+
+`QFuture` 赋值**不会等待**上一个任务（只转移内部 d 指针的引用，`~QFuture()`
+也不阻塞）。所以上一次播放若尚未结束，它就变成"被丢弃但仍在运行"的任务：
+
+- 它捕获的 `flag` 已不再是 `interruptFlag` 指向的对象，`stop()` 再也打不断
+  它 —— 会把整段提示音播完，并继续持有静态 `pcmMutex`；
+- 析构只 `waitForFinished()` **最后一个** future，旧任务完全不被等待，于是
+  析构返回后它仍在 `emit` 信号、读成员 —— use-after-free。
+
+修法是把所有未完成任务收集起来、析构时逐个等待（`QVector<QFuture<void>>`
++ `waitForAllTasks()`），且必须先 `stop()` 再等，否则析构会阻塞到整段音频
+播完。
+
+本工程当前未使用 `QtConcurrent` / `QFuture`，本条作为**回归防护**存在：一旦
+有人为天气请求或媒体播放引入 `QtConcurrent`，这种"每次覆盖同一个 QFuture"
+的写法会立刻被拦下。由 `check_abandoned_async_tasks` 强制，自检见
+`tools/verify_abandoned_task.py`（5/5 用例）。注意**不误伤即发即忘的用法**：
+不把结果赋给任何变量、且自带 `QPointer` 守卫的任务不存在"被覆盖丢弃"问题。
+
+用 `.clang-format` 统一格式，但**格式不是正确性**——上述十一条请以
 `verify.py` 的结果为准。
 
 ---
@@ -448,12 +476,14 @@ python3 tools/verify.py .
 python3 tools/check_signatures.py .
 
 # 2b. 校验器自检：对 check_config_value_sanity / check_config_knobs_are_used /
-#     check_declared_signal_is_emitted / check_connect_signal_is_signal
+#     check_declared_signal_is_emitted / check_connect_signal_is_signal /
+#     check_abandoned_async_tasks
 #     做故障注入。静态规则写错会静默失效，必须证明它真能区分好坏代码。
 python3 tools/verify_config_sanity.py .
 python3 tools/verify_config_knobs.py .
 python3 tools/verify_dead_signal.py .
 python3 tools/verify_connect_signal.py .
+python3 tools/verify_abandoned_task.py .
 
 # 3. 跨仓库协议一致性
 python3 tools/check_protocol_sync.py
