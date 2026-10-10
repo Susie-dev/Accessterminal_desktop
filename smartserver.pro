@@ -10,6 +10,10 @@ greaterThan(QT_MAJOR_VERSION, 4): QT += widgets
 
 CONFIG += c++11 warn_on
 
+# 与 CMakeLists.txt 的 ACCESSTERMINAL_WARNINGS 保持一致：
+# 开启 -Wall -Wextra，但不启用 -Werror。
+QMAKE_CXXFLAGS += -Wall -Wextra -Wno-unused-parameter
+
 TARGET = smartserver
 TEMPLATE = app
 

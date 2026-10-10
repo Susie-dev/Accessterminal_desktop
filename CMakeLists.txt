@@ -27,6 +27,21 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # 使源码内 #include "core/net/protocol.h" 等以 src/ 为根。
 set(CMAKE_INCLUDE_CURRENT_DIR ON)
 
+# ---------------------------------------------------------------------------
+# 警告设置
+#
+# 默认开启 -Wall -Wextra，让“定义了却没用到的函数”“有符号/无符号比较”
+# 这类问题在编译期就暴露，而不是等运行时。
+# 不启用 -Werror：不同 GCC/Qt 版本的告警集合会变，卡死构建反而无益。
+# ---------------------------------------------------------------------------
+option(ACCESSTERMINAL_WARNINGS "开启编译警告 (-Wall -Wextra)" ON)
+
+if(ACCESSTERMINAL_WARNINGS AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    add_compile_options(-Wall -Wextra)
+    # 未使用的参数在 Qt 的虚函数重写与信号槽里很常见，噪声大于价值。
+    add_compile_options(-Wno-unused-parameter)
+endif()
+
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)

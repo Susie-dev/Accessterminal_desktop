@@ -69,7 +69,6 @@ void envOverride(const char* name, T& target, Converter convert)
 }
 
 QString toQString(const QByteArray& v) { return QString::fromLocal8Bit(v); }
-int toInt(const QByteArray& v) { return v.toInt(); }
 
 } // namespace
 
