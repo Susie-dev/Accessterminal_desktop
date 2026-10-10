@@ -202,7 +202,7 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 
 ## 关键约定（由自动化检查强制）
 
-以下八条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+以下十条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
 `tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
 
 ### 1. 音视频通道只在接听后建立
@@ -368,7 +368,61 @@ int ringtoneVolume() const { return clampInt(m_ringtoneVolume, 0, 100); }
 `m_x = jsonInt(o, "x", m_x)` 只是回退实参，若把它算作消费，假旋钮就会被
 漏掉（该规则第一版正是这样漏掉了门口机的 `faceConfidenceThreshold`）。
 
-用 `.clang-format` 统一格式，但**格式不是正确性**——上述八条请以
+### 9. `signals:` 里声明的信号必须真的会被发射
+
+一个只声明、从不发射的信号是**死信号**：任何 connect 到它的槽永远不会被
+调用，而编译、链接、静态检查全都不会报错。
+
+门口机已经踩过这个坑：`AudioSenderThread::connectionLost()` 被声明、被连接，
+connect 的注释还明确写着用途——
+
+```cpp
+// 采集线程报告连接丢失时立即挂断，避免通话卡死。
+connect(m_audioSenderThread, &AudioSenderThread::connectionLost,
+        this, &Widget::hangUpCall);
+```
+
+——但全工程从未 `emit` 过它。于是 sendto 失败后采集循环 break、线程结束，
+再无任何帧发往室内机，通话已单向静音，界面却依旧显示“通话中”，用户只能
+手动挂断。这条“避免卡死”的兜底实际是死的。
+
+本工程当前无死信号，本条作为**回归防护**存在：通话链路依赖
+`accepted` / `answered` / `hangupClicked` / `videoFrameReady` 等信号，一旦
+有人把它们改成“只声明不发射”，通话会静默失效且难以定位。
+
+判定一个信号“真的会触发”只有两种途径：
+
+1. 被显式发射：`emit S(...)` 或直接调用 `S(...)`；
+2. 作为 connect 的**第 4 个实参**出现（信号→信号链式连接，
+   `connect(btn, &QPushButton::clicked, this, &Cls::S)`）——源信号触发时
+   Qt 会自动发射 S。
+
+第 2 条不能漏：漏掉就会把链式目标误判为死信号。反过来也要注意，
+`connect(this, &Cls::src, this, &Cls::dst)` 里的 `src` 是**源**，它自己
+必须另有 emit 出口，否则整条链依然永不触发（检查会正确地报 `src` 是死的）。
+
+由 `check_declared_signal_is_emitted` 强制，自检见
+`tools/verify_dead_signal.py`（10/10 用例）。
+
+### 10. connect 实参必须能正确切分（`->` 陷阱）
+
+第 5 条（`connect` 第二实参必须是信号）依赖“按顶层逗号切分实参”。而本工程
+最常见的写法首实参就含 `->`：
+
+```cpp
+connect(ui->addface, &QPushButton::clicked, this, &Form_finger::addFaceRequested);
+```
+
+若切分器把 `>` 也当作需要配对的括号（`if ch in "(<[" / elif ch in ")>]"`），
+每遇到一个 `->` 深度就偏负一次，**顶层逗号再也分不出来**，整条实参列表被当成
+1 个实参；检查随后因 `len(args) < 2` 直接 `continue`，**静默跳过这条
+connect**——既不报错也不提示。
+
+门口机就因此漏检了 6 条 connect（33/39）。现在切分只让 `()`/`[]`/`{}` 参与
+配对，`->` 与 `>>` 不计数。由 `tools/verify_connect_signal.py`
+（5/5 用例，含“首实参含 `->` 且第二实参是槽”的真阳性）锁定。
+
+用 `.clang-format` 统一格式，但**格式不是正确性**——上述十条请以
 `verify.py` 的结果为准。
 
 ---
@@ -393,11 +447,13 @@ python3 tools/verify.py .
 # 2. 签名一致性（.h 声明 vs .cpp 定义）
 python3 tools/check_signatures.py .
 
-# 2b. 校验器自检：对 check_config_value_sanity / check_config_knobs_are_used
-#     做故障注入（各 6/6 用例）。静态规则写错会静默失效，必须证明它真能
-#     区分好坏代码。
+# 2b. 校验器自检：对 check_config_value_sanity / check_config_knobs_are_used /
+#     check_declared_signal_is_emitted / check_connect_signal_is_signal
+#     做故障注入。静态规则写错会静默失效，必须证明它真能区分好坏代码。
 python3 tools/verify_config_sanity.py .
 python3 tools/verify_config_knobs.py .
+python3 tools/verify_dead_signal.py .
+python3 tools/verify_connect_signal.py .
 
 # 3. 跨仓库协议一致性
 python3 tools/check_protocol_sync.py

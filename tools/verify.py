@@ -190,6 +190,73 @@ def strip_comments_and_strings(text):
     return text
 
 
+def split_top_level_args(call):
+    """
+    按**顶层逗号**切分一个调用/参数列表文本，返回实参列表。
+
+    为什么需要它：`connect()` 的实参里经常出现 `->` 与 `>`，
+    `ui->addface, &QPushButton::clicked, this, &Cls::S`。
+
+    一个常见的错误写法是把 `>` 也当成"需要配对的括号"：
+
+        if ch in "(<[": depth += 1
+        elif ch in ")>]": depth -= 1        # 错！`->` 里的 `>` 会误减
+
+    这样每遇到一个 `->`，depth 就偏负一次，于是**顶层逗号再也分不出来**，
+    整个实参列表被当成 1 个实参。后果是静默的：按索引取第 2/第 4 个实参的
+    检查会因为 `len(args) < 2` 而直接 `continue`，**跳过所有首实参含 `->`
+    的 connect**（例如 `connect(ui->addface, ...)`），既不报错也不提示。
+
+    这里只让真正的 `(`/`)`、`[`/`]`、`{`/`}` 参与配对，`<`/`>` 仅在
+    **成对尖括号模板**的常见形态下计数（用于 `QVector<int>` 这类逗号），
+    并且要求 `<` 前是标识符、`>` 后不是 `>`（排除 `->` 与 `>>`）。
+    """
+    args, depth, cur = [], 0, ""
+    i, n = 0, len(call)
+    while i < n:
+        ch = call[i]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == "<":
+            # 仅把 `标识符<` 视作模板起始；`a < b` 会同时匹配，但这类比较在
+            # connect 实参里几乎不出现，且退化为不计数也只是保守（少切分）。
+            if i > 0 and (call[i - 1].isalnum() or call[i - 1] == "_"):
+                depth += 1
+        elif ch == ">":
+            # `->` 与 `>>` 不参与配对
+            if i > 0 and call[i - 1] == "-":
+                pass
+            elif i + 1 < n and call[i + 1] == ">":
+                pass
+            else:
+                depth -= 1
+        if ch == "," and depth == 0:
+            args.append(cur)
+            cur = ""
+        else:
+            cur += ch
+        i += 1
+    if cur.strip():
+        args.append(cur)
+    return args
+
+
+def enclosing_call_text(text, open_paren_idx):
+    """给定左括号下标，返回配对右括号之前的完整调用文本。"""
+    depth, i = 0, open_paren_idx
+    while i < len(text):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                break
+        i += 1
+    return text[open_paren_idx + 1:i]
+
+
 def check_legacy_identifiers(root, src_root):
     """重构后的源码不应再出现旧路径/旧标识符（忽略注释与字符串）。"""
     legacy = [
@@ -990,32 +1057,8 @@ def check_connect_signal_is_signal(root, src_root):
         text = strip_comments_and_strings(read(path))
         rel = os.path.relpath(path, root)
         for m in re.finditer(r'\bconnect\s*\(', text):
-            open_idx = m.end() - 1
-            depth, i = 0, open_idx
-            while i < len(text):
-                if text[i] == "(":
-                    depth += 1
-                elif text[i] == ")":
-                    depth -= 1
-                    if depth == 0:
-                        break
-                i += 1
-            call = text[open_idx + 1:i]
-
-            # 按顶层逗号切分实参
-            args, depth2, cur = [], 0, ""
-            for ch in call:
-                if ch in "(<[":
-                    depth2 += 1
-                elif ch in ")>]":
-                    depth2 -= 1
-                if ch == "," and depth2 == 0:
-                    args.append(cur)
-                    cur = ""
-                else:
-                    cur += ch
-            if cur.strip():
-                args.append(cur)
+            args = split_top_level_args(
+                enclosing_call_text(text, m.end() - 1))
             if len(args) < 2:
                 continue
 
@@ -1034,6 +1077,108 @@ def check_connect_signal_is_signal(root, src_root):
                  "connect 必然失败并打印 \"signal not found in {}\"，"
                  "对应槽是死代码。"
                  .format(rel, line, cname, name, cname))
+
+
+def check_declared_signal_is_emitted(root, src_root):
+    """
+    声明在 `signals:` 下的信号必须真的会被发射。
+
+    背景（门口机侧的真实缺陷，本轮同步建立本检查）：
+    `AudioSenderThread::connectionLost()` 被声明、被 Widget 连接、并且那段
+    connect 的注释明确写着用途——
+
+        // 采集线程报告连接丢失时立即挂断，避免通话卡死。
+        connect(m_audioSenderThread, &AudioSenderThread::connectionLost,
+                this, &Widget::hangUpCall);
+
+    ——但**全工程从未 emit 过它**。于是这条兜底是死的：sendto 失败后采集循环
+    break、线程结束，再无任何帧发往室内机，通话已单向静音，而界面依旧显示
+    “通话中”，用户只能手动挂断。
+
+    室内机当前无此问题（0 个死信号），本检查在此作为**回归防护**存在：
+    `handleCall()`/`reply()` 这条链路依赖的 `accepted`/`answered`/
+    `hangupClicked` 等信号一旦被改成“只声明不发射”，通话将静默失效。
+
+    判定一个信号“真的会触发”只有两种途径：
+      1. 被显式发射：`emit S(...)` 或直接调用 `S(...)`；
+      2. 作为 connect 的**第 4 个实参**出现 —— 这是 Qt 的信号→信号链式连接
+         （`connect(btn, &QPushButton::clicked, this, &Cls::S)`），源信号
+         触发时 Qt 会自动发射 S。漏掉这一条会把链式目标误判为死信号。
+
+    不判定经由 `QMetaObject::invokeMethod("name")` 触发的槽（本工程无此用法），
+    也不判定字符串形式的 `SIGNAL()`（本工程已全部清除）。继承自基类的信号
+    不在声明集合内，天然不参与判定。
+    """
+    sig_re = r'^\s*(?:(?:public|private|protected)\s+)?(?:signals|Q_SIGNALS)\s*:'
+    slot_re = r'^\s*(?:(?:public|private|protected)\s+)?(?:slots|Q_SLOTS)\s*:'
+    acc_re = r'^\s*(?:public|private|protected)\s*:'
+    mem_re = r'^(?:[\w:<>,\*&\s]+?\s)?~?(\w+)\s*\('
+
+    # 1) 收集每个含 Q_OBJECT 的类在 signals: 区声明的信号
+    declared = {}
+    for hpath in find_files(src_root, {".h", ".hpp"}):
+        htext = strip_comments_and_strings(read(hpath))
+        for cm in re.finditer(r'\bclass\s+(\w+)\s*(?::[^{;]*)?\{', htext):
+            cname = cm.group(1)
+            start = cm.end() - 1
+            depth, i = 0, start
+            while i < len(htext):
+                if htext[i] == "{":
+                    depth += 1
+                elif htext[i] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                i += 1
+            body = htext[start + 1:i]
+            if "Q_OBJECT" not in body:
+                continue
+            cur = False
+            for line in body.split("\n"):
+                if re.match(sig_re, line):
+                    cur = True
+                    continue
+                if re.match(slot_re, line) or re.match(acc_re, line):
+                    cur = False
+                    continue
+                if cur:
+                    m = re.match(mem_re, line.strip())
+                    if m:
+                        declared.setdefault(
+                            (cname, m.group(1)), os.path.relpath(hpath, root))
+
+    if not declared:
+        return
+
+    # 2) 收集 emit 目标、以及 connect 第 4 实参构成的链式目标
+    emitted, chained = set(), set()
+    for path in find_files(src_root, {".cpp"}):
+        text = strip_comments_and_strings(read(path))
+        for m in re.finditer(r'\bemit\s+(\w+)\s*\(', text):
+            emitted.add(m.group(1))
+        # 无 emit 关键字的直接调用（信号也是普通成员函数，可以直呼）
+        for (cname, sig) in list(declared):
+            if re.search(r'(?<![\w:.>&])' + re.escape(sig) + r'\s*\(', text):
+                emitted.add(sig)
+
+        for m in re.finditer(r'\bconnect\s*\(', text):
+            args = split_top_level_args(
+                enclosing_call_text(text, m.end() - 1))
+            # 只需第 4 个实参（索引 3）作为链式发射目标
+            if len(args) >= 4:
+                m4 = re.search(r'&\s*(\w+)\s*::\s*(\w+)', args[3])
+                if m4:
+                    chained.add((m4.group(1), m4.group(2)))
+
+    # 3) 判定
+    for (cname, sig), rel in sorted(declared.items()):
+        if sig in emitted or (cname, sig) in chained:
+            continue
+        fail("[dead-signal] {}: 信号 {}::{}() 声明在 signals: 区，但全工程既未 "
+             "emit 它，也不是任何 connect 的链式发射目标 —— 它是一个永远不会"
+             "触发的死信号。若有代码 connect 到它，那条连接与对应槽都是死代码"
+             "（门口机曾因此丢掉 \"采集线程连接丢失即挂断\" 的兜底）。"
+             .format(rel, cname, sig))
 
 
 def main():
@@ -1063,6 +1208,7 @@ def main():
     check_json_configs(root)
     check_config_value_sanity(root, src_root)
     check_config_knobs_are_used(root, src_root)
+    check_declared_signal_is_emitted(root, src_root)
 
     print(f"校验目录: {root}")
     print("=" * 70)
