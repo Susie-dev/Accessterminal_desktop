@@ -54,12 +54,17 @@ QByteArray parseHexBytes(const QString& text)
 }
 
 /// 环境变量覆盖：存在且非空时生效。
-template <typename T>
-void envOverride(const char* name, T& target, T (*convert)(const QByteArray&))
+///
+/// 转换器（convert）单独作为模板参数而非写死成函数指针：
+/// 无捕获 lambda 虽然能隐式转换成函数指针，但该转换在模板实参推导
+/// 阶段不参与，写死 T (*)(const QByteArray&) 会导致传入 lambda 时
+/// 推导失败（编译错误）。此处放宽到任意可调用对象。
+template <typename T, typename Converter>
+void envOverride(const char* name, T& target, Converter convert)
 {
     const QByteArray value = qgetenv(name);
     if (!value.isEmpty()) {
-        target = convert(value);
+        target = static_cast<T>(convert(value));
     }
 }
 

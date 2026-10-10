@@ -18,6 +18,8 @@
 #include <QUrl>
 #include <QImage>
 
+using accessterminal::AppConfig;
+
 Form_phonecall::Form_phonecall(QWidget* parent, bool playRing)
     : QWidget(parent)
     , ui(new Ui::Form_phonecall)
@@ -106,7 +108,7 @@ void Form_phonecall::stopRing()
     }
 }
 
-void Form_phonecall::eventFilter(QObject* watched, QEvent* event)
+bool Form_phonecall::eventFilter(QObject* watched, QEvent* event)
 {
     if (watched != ui->label_slider) {
         return QWidget::eventFilter(watched, event);
