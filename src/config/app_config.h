@@ -23,6 +23,23 @@
 namespace accessterminal {
 
 /**
+ * @brief 把配置中的整数值限制到 [lo, hi]。
+ *
+ * 配置来源（JSON 文件、环境变量）都是不可信输入：
+ *   - 环境变量用 QString::toInt()/toUShort() 解析，**非法文本返回 0**；
+ *   - JSON 里也可以直接写 0、负数或超出 quint16 的值。
+ *
+ * 在取值出口统一兜底，合法配置的行为与重构前逐字节一致。
+ * 与门口机 app_config.h 中的同名辅助函数保持对称。
+ */
+inline int clampInt(int value, int lo, int hi)
+{
+    if (value < lo) return lo;
+    if (value > hi) return hi;
+    return value;
+}
+
+/**
  * @brief 应用配置单例。
  *
  * 在 QApplication 构造后、任何模块创建前调用一次 load()。
@@ -44,8 +61,14 @@ public:
     QString selfIp() const { return m_selfIp; }
     /// T113 门口机地址，远程监看时作为 UDP 目标。
     QString deviceIp() const { return m_deviceIp; }
-    /// 信令 TCP 端口（室内机监听）。
-    quint16 signalingPort() const { return m_signalingPort; }
+    /**
+     * @brief 信令 TCP 端口（室内机监听）。
+     *
+     * 下限取 1：端口 0 会让 QTcpServer 绑定到一个随机临时端口，
+     * 门口机仍按 8887 连接，结果是永远连不上且日志里看不出原因。
+     * 默认值 8887 不受影响。
+     */
+    quint16 signalingPort() const { return static_cast<quint16>(clampInt(m_signalingPort, 1, 65535)); }
 
     // ---- 硬件 ----
     /// 灯控串口设备名。Linux 下形如 /dev/ttyUSB0，不再是 Windows 的 COM24。
@@ -58,8 +81,9 @@ public:
     // ---- 音视频 ----
     /// 门铃音资源路径。
     QString ringtonePath() const { return m_ringtonePath; }
-    /// 门铃音音量（0-100）。
-    int ringtoneVolume() const { return m_ringtoneVolume; }
+    /// 门铃音音量（0-100）。QMediaPlayer::setVolume 超出范围的行为未定义，
+    /// 这里收敛到 0~100；默认值 100 不受影响。
+    int ringtoneVolume() const { return clampInt(m_ringtoneVolume, 0, 100); }
 
     // ---- 灯控指令 ----
     /// 灯控串口指令（十六进制字节序列）。

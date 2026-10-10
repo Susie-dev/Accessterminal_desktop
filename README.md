@@ -202,7 +202,7 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 
 ## 关键约定（由自动化检查强制）
 
-以下六条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+以下七条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
 `tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
 
 ### 1. 音视频通道只在接听后建立
@@ -317,7 +317,38 @@ timer->start(500);
 （常驻识别与指纹注册抢同一个串口），本工程当前无该形态代码，本条为
 预防性对称检查。
 
-用 `.clang-format` 统一格式，但**格式不是正确性**——上述六条请以
+### 7. 数值配置必须在取值出口做范围兜底
+
+配置（JSON 文件、环境变量）是**不可信输入**。环境变量经
+`QString::toInt()` / `toUShort()` 解析时，非法文本会**静默返回 0**；
+JSON 里也可以直接写 0、负数或超出 `quint16` 的值。
+
+本工程受影响的是这两个：
+
+- `signaling_port` 配成 0 → `QTcpServer` 绑定到**随机临时端口**，
+  门口机仍按 8887 连接，表现为「永远连不上」且日志里看不出原因；
+- `ringtone_volume` 越界 → `QMediaPlayer::setVolume` 的行为未定义。
+
+门口机那边同一模式已经造成**真实崩溃**：重构前是硬编码
+`const int detect_interval = 10;`，改成 `cfg.faceDetectInterval()` 后，
+配置为 0 就在 `++detectCounter % cfg.faceDetectInterval()` 处触发整数
+除零（`SIGFPE`，进程直接崩溃）。
+
+修法是在**取值出口**统一兜底（`app_config.h` 的 `clampInt()`），
+所有调用方一次性被覆盖，且合法值（默认值与示例配置）经兜底后不变：
+
+```cpp
+quint16 signalingPort() const {
+    return static_cast<quint16>(clampInt(m_signalingPort, 1, 65535));
+}
+int ringtoneVolume() const { return clampInt(m_ringtoneVolume, 0, 100); }
+```
+
+由 `check_config_value_sanity` 强制（与门口机同一条规则），并且它自己也
+有故障注入自检（`tools/verify_config_sanity.py`，6/6 用例）——静态规则
+写错会静默失效，必须证明它真的能区分好坏代码。
+
+用 `.clang-format` 统一格式，但**格式不是正确性**——上述七条请以
 `verify.py` 的结果为准。
 
 ---
@@ -341,6 +372,10 @@ python3 tools/verify.py .
 
 # 2. 签名一致性（.h 声明 vs .cpp 定义）
 python3 tools/check_signatures.py .
+
+# 2b. 校验器自检：对 check_config_value_sanity 做故障注入（6/6 用例）
+#     静态规则写错会静默失效，用故障注入证明它真的能区分好坏代码。
+python3 tools/verify_config_sanity.py .
 
 # 3. 跨仓库协议一致性
 python3 tools/check_protocol_sync.py

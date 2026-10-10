@@ -343,6 +343,93 @@ def check_json_configs(root):
                 fail(f"[json] {name} 字段 {'.'.join(keys)} 类型应为 {typ.__name__}，"
                      f"实为 {type(node).__name__}")
 
+        # 数值型字段还要做**取值**校验：随包发布的示例配置本身不能带
+        # 端口 0 / 音量越界这类值（取值出口的兜底见
+        # check_config_value_sanity()，两者互补）。
+        # 注意 bool 是 int 的子类，需显式排除，否则 true 会被当成合法整数。
+        ranges = [
+            (("network", "signaling_port"), 1, 65535),
+            (("media", "ringtone_volume"), 0, 100),
+        ]
+        for keys, lo, hi in ranges:
+            node = data
+            ok = True
+            for k in keys:
+                if not isinstance(node, dict) or k not in node:
+                    ok = False
+                    break
+                node = node[k]
+            if not ok or isinstance(node, bool) or not isinstance(node, (int, float)):
+                continue  # 缺失/类型错误已在上面的 checks 中报过
+            if not (lo <= node <= hi):
+                fail(f"[json] {name} 字段 {'.'.join(keys)} 取值 {node} "
+                     f"越界，允许范围 [{lo}, {hi}]")
+
+
+def check_config_value_sanity(root, src_root):
+    """
+    数值型配置的取值出口必须做范围兜底。
+
+    背景：配置（JSON 文件、环境变量）是不可信输入。环境变量经
+    QString::toInt()/toUShort() 解析时，**非法文本会静默返回 0**；
+    JSON 里也可以写 0、负数或超出 quint16 的值。这些值一旦直接进入
+    端口绑定、音量设置等位置，就会出现“端口 0 → 绑定随机端口，门口机
+    永远连不上”，或 setVolume 传入越界值。
+
+    门口机那边同一模式已经造成真实崩溃：重构前是硬编码
+    `const int detect_interval = 10;`，改成 cfg.faceDetectInterval() 后，
+    配置为 0 就在 `++detectCounter % cfg.faceDetectInterval()` 处触发
+    整数除零（SIGFPE，进程崩溃）。本规则与门口机的同名检查保持对称。
+
+    做法：
+      A) 所有 int/double/quint16 型配置访问器都必须被 clampInt()/
+         clampDouble() 包住；
+      B) 若某处直接用配置取值做除数，该访问器同样必须被兜底。
+    """
+    header = os.path.join(src_root, "config", "app_config.h")
+    if not os.path.isfile(header):
+        fail("[config-sanity] 找不到 src/config/app_config.h")
+        return
+    htext = strip_comments_and_strings(read(header))
+
+    getter_re = re.compile(
+        r'\b(?:int|double|quint16|qint16|qint32|quint32|long|short)\s+'
+        r'(\w+)\s*\(\s*\)\s*const\s*\{([^{}]*)\}')
+    # 必须匹配 `return clampInt(` 这种调用形态，避免被裸子串误命中。
+    clamp_call_re = re.compile(r'\breturn\b[^;]*\bclamp(?:Int|Double)\s*\(')
+    numeric_getters = {}
+    for name, body in getter_re.findall(htext):
+        numeric_getters[name] = bool(clamp_call_re.search(body))
+
+    if not numeric_getters:
+        fail("[config-sanity] 未在 app_config.h 中解析到任何数值型访问器"
+             "（检查器已失效，请更新正则）")
+        return
+
+    unprotected = sorted(n for n, ok in numeric_getters.items() if not ok)
+    if unprotected:
+        fail("[config-sanity] 这些数值型配置访问器未做范围兜底: "
+             + ", ".join(unprotected)
+             + "（配置值可为 0/负数，用于端口或除数时行为异常）")
+
+    # ---- B) 用配置取值做除数的地方 ----
+    divisor_re = re.compile(
+        r'[%\/]\s*(?:cfg|AppConfig::instance\(\))\s*\.\s*(\w+)\s*\(\s*\)')
+
+    for path in find_files(src_root, {".cpp", ".h"}):
+        text = strip_comments_and_strings(read(path))
+        for m in divisor_re.finditer(text):
+            getter = m.group(1)
+            line = text.count("\n", 0, m.start()) + 1
+            rel = os.path.relpath(path, root)
+            if getter not in numeric_getters:
+                warn(f"[config-sanity] {rel}:{line} 用 cfg.{getter}() 做除数，"
+                     f"但未在 app_config.h 找到数值型访问器，请人工确认")
+                continue
+            if not numeric_getters[getter]:
+                fail(f"[config-sanity] {rel}:{line} 用未兜底的配置值 "
+                     f"cfg.{getter}() 做除数，配置为 0 时会除零崩溃")
+
 
 def check_media_gated_by_answer(root, src_root):
     """
@@ -833,6 +920,7 @@ def main():
     check_datagram_read_returns(root, src_root)
     check_connect_signal_is_signal(root, src_root)
     check_json_configs(root)
+    check_config_value_sanity(root, src_root)
 
     print(f"校验目录: {root}")
     print("=" * 70)
