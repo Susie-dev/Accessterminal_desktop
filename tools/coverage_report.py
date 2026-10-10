@@ -87,6 +87,135 @@ def collect(repo_root, build_dir, gcov_bin):
     return lines
 
 
+
+
+def _fmt_ranges(nums):
+    """把行号列表压成 L1-L5,L9 形式，便于阅读。"""
+    if not nums:
+        return ""
+    nums = sorted(nums)
+    out, start, prev = [], nums[0], nums[0]
+    for n in nums[1:]:
+        if n == prev + 1:
+            prev = n
+            continue
+        out.append("%d-%d" % (start, prev) if prev > start else "%d" % start)
+        start = prev = n
+    out.append("%d-%d" % (start, prev) if prev > start else "%d" % start)
+    return ",".join("L" + x for x in out)
+
+
+def _iter_sources(src_root):
+    """src/ 下所有 C++ 源文件（相对仓库根的路径 -> 绝对路径）。"""
+    out = {}
+    for dp, dn, fn in os.walk(src_root):
+        dn[:] = [d for d in dn if d not in (".git", "build", "docs", "deploy")]
+        for f in fn:
+            if f.endswith((".cpp", ".h", ".hpp")):
+                p = os.path.join(dp, f)
+                out[p] = None
+    return out
+
+
+def member_functions(src_root):
+    """抽取成员函数定义：{绝对路径: [(方法名, 起始行, 结束行), ...]}。"""
+    import re as _re
+    per_file = {}
+    for path in _iter_sources(src_root):
+        try:
+            text = io.open(path, encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        defs = []
+        for m in _re.finditer(
+                r"^[\w:<>,\*&\s]*?([A-Za-z_]\w*)::([A-Za-z_]\w*)\s*\(",
+                text, _re.M):
+            cls, name = m.group(1), m.group(2)
+            # 构造/析构也算成员函数（~ 不在上面的字符类里，单列）
+            try:
+                brace = text.index("{", m.start())
+            except ValueError:
+                continue
+            depth, k = 0, brace
+            while k < len(text):
+                if text[k] == "{":
+                    depth += 1
+                elif text[k] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                k += 1
+            a = text.count("\n", 0, m.start()) + 1
+            b = text.count("\n", 0, k) + 1
+            defs.append((name, a, b))
+        per_file[path] = defs
+    return per_file
+
+
+def called_method_names(src_root):
+    """生产代码（src/ 下）里出现过的**调用**方法名集合。"""
+    import re as _re
+    called = set()
+    for path in _iter_sources(src_root):
+        try:
+            text = io.open(path, encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        # 去掉注释，避免把注释里提到的名字当成调用
+        text = _re.sub(r"/\*[\s\S]*?\*/", "", text)
+        text = _re.sub(r"//[^\n]*", "", text)
+        for m in _re.finditer(r"(?<![\w:>.])([A-Za-z_]\w*)\s*\(", text):
+            name = m.group(1)
+            ls = text.rfind("\n", 0, m.start()) + 1
+            line = text[ls:text.find("\n", m.start())]
+            # 跳过定义行 `Class::name(` 与声明行
+            if "::" + name + "(" in line:
+                continue
+            head = line[:line.find(name)]
+            if _re.search(r"(bool|void|int|quint\d+|QByteArray|QString|QMutex\s*\*|"
+                          r"static|inline|explicit)\s+$", head):
+                continue
+            called.add(name)
+    return called
+
+
+def classify_uncovered(repo_root, rows, src_root):
+    """给每个文件的未覆盖行标注"不可达 / 可达未测"。
+
+    返回 {相对路径: {"dead": [行...], "live": [行...]}}。
+    """
+    per_file = member_functions(src_root)
+    called = called_method_names(src_root)
+
+    # 相对路径 -> 绝对路径
+    by_rel = {}
+    for path in per_file:
+        by_rel[os.path.relpath(path, repo_root).replace("\\", "/")] = path
+
+    out = {}
+    for r in rows:
+        rel = r["file"]
+        path = by_rel.get(rel)
+        if path is None:
+            out[rel] = {"dead": [], "live": list(r["uncovered_lines"])}
+            continue
+        defs = per_file[path]
+        dead, live = [], []
+        for ln in r["uncovered_lines"]:
+            owner = None
+            for name, a, b in defs:
+                if a <= ln <= b:
+                    owner = name
+                    break
+            if owner is not None and owner not in called:
+                dead.append(ln)
+            else:
+                live.append(ln)
+        out[rel] = {"dead": dead, "live": live}
+    return out
+
+
+
 def summarize(lines):
     rows = []
     for rel, ln in sorted(lines.items()):
@@ -158,6 +287,51 @@ def main():
         print("-" * 78)
         print("%-52s %7d %7d %6.1f%%" % ("合计", tot_l, tot_c, overall))
 
+        # ---- 未覆盖行的可达性分类（第 26 轮新增）----
+        #
+        # 只报"未覆盖 N 行"会同时误导两个方向：把基线就没接线的死代码算成
+        # "待补的缺口"，又把真正可补的那几十行淹没在噪声里。
+        # 这里把未覆盖行拆成「静态不可达」与「可达未测」，后者才是待办。
+        try:
+            cls = classify_uncovered(repo_root, rows, src_root)
+        except Exception:
+            cls = {}
+        tot_dead = sum(len(v["dead"]) for v in cls.values())
+        tot_live = sum(len(v["live"]) for v in cls.values())
+        if cls and (tot_dead or tot_live):
+            print()
+            print("-" * 78)
+            print("未覆盖行的可达性分类（可达未测才是待办）")
+            print("-" * 78)
+            print("%-52s %8s %8s" % ("文件", "不可达", "可达未测"))
+            for r in sorted(rows, key=lambda x: -len(cls.get(x["file"],
+                              {}).get("live", []))):
+                v = cls.get(r["file"])
+                if not v or not (v["dead"] or v["live"]):
+                    continue
+                print("%-52s %8d %8d" % (r["file"][:52], len(v["dead"]),
+                                         len(v["live"])))
+            print("-" * 78)
+            print("%-52s %8d %8d" % ("合计", tot_dead, tot_live))
+            print()
+            print("   「不可达」= 该行所在函数在生产代码里**零调用者**"
+                  "（静态不可达）。")
+            print("   为它写运行时测试只会测到『平行实现』，不是产线路径"
+                  "（见 README 第 30 条）。")
+            print("   这类行常来自 baseline —— 重构忠实地保留了它们，"
+                  "既不是缺陷也不该被算作待办。")
+            print("   「可达未测」= 所在函数确有调用者，只是没有测试执行到。")
+            print("   **待办看右边那一列。**")
+            live_files = [(r["file"], cls[r["file"]]["live"]) for r in rows
+                          if cls.get(r["file"], {}).get("live")]
+            if live_files:
+                print()
+                print("   可达但未执行的具体行：")
+                for rel, lns in sorted(live_files,
+                                       key=lambda x: -len(x[1])):
+                    print("     %s  (%d 行)" % (rel, len(lns)))
+                    print("       %s" % _fmt_ranges(lns))
+
         zero = [r for r in rows if r["covered"] == 0 and r["lines"] > 0]
         if zero:
             print()
@@ -213,10 +387,22 @@ def main():
 
     if json_out:
         with io.open(json_out, "w", encoding="utf-8", newline="\n") as fh:
+            try:
+                cls = classify_uncovered(repo_root, rows, src_root)
+            except Exception:
+                cls = {}
+            for r in rows:
+                v = cls.get(r["file"], {"dead": [], "live": []})
+                r["uncovered_dead"] = v["dead"]
+                r["uncovered_live"] = v["live"]
             fh.write(json.dumps({
                 "overall_pct": round(overall, 2),
                 "total_lines": tot_l,
                 "covered_lines": tot_c,
+                "uncovered_dead_total": sum(len(v["dead"])
+                                            for v in cls.values()),
+                "uncovered_live_total": sum(len(v["live"])
+                                            for v in cls.values()),
                 "files": rows,
             }, ensure_ascii=False, indent=2))
     return 0

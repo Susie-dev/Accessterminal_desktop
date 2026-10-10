@@ -2459,6 +2459,66 @@ def check_tool_scripts_are_console_encoding_safe(root, src_root):
 
 
 
+def check_coverage_separates_dead_from_untested(root, src_root):
+    r"""
+    覆盖率必须把"未覆盖行"拆成「静态不可达」与「可达未测」。
+
+    背景（第 26 轮）
+    ---------------
+    `fingerprint_hailin.cpp` 报 17.9%，像个大洞。拆开一看：
+
+        可执行行 285
+          零调用者（静态不可达，且 baseline 亦然）  204 行 = 71.6%
+          有调用者（真的没测到）                     81 行，其中未执行 30 行
+
+    只报一个百分比会**同时误导两个方向**：既把基线就没接线的死代码算成
+    "待补缺口"（为它写测试只会测到『平行实现』，见第 30 条），又把真正可补的
+    那几十行淹没在噪声里。
+
+    本工程有大量这类方法：`HailinFingerprint::autoIdentify/autoEnroll/cancel/
+    stepRegister/stepIdentify` 五个入口**在生产代码里零调用者**，且实测
+    baseline 同样零调用者 —— 继承而来，既不是缺陷也不该算作待办。
+
+    规则：`tools/coverage_report.py` 必须输出未覆盖行的可达性分类，并明确
+    指出"待办看可达未测那一列"。判定依据是"所在成员函数在生产代码里有无调用点"。
+
+    附带要求（第 25 轮约定的一体两面）：脚本必须在**目标控制台编码**下可输出，
+    即含 `reconfigure(encoding="utf-8"`，否则分类报告可能在打印时崩掉。
+
+    能力边界（如实记录，避免高估本规则）
+    ----------------------------------
+    这是一条"**能力存在性 + 分类标签存在性**"检查，它验证的是：
+    分类函数在、且报告里两个类别都显式输出。它**不能**发现"函数还在但
+    被掏空成 `return {}`"这类问题 —— 那需要运行脚本来验证。
+
+    因此本规则与"跑一次 coverage_report.py 看输出"是**互补**的，不是替代。
+    故障注入实测：一致地改名（行为不变）时本规则通过是**正确**的 ——
+    它检查的是能力是否存在，不是"有没有被改动"。
+    """
+    rep = os.path.join(root, "tools", "coverage_report.py")
+    if not os.path.exists(rep):
+        return          # check_coverage_denominator_is_declared 已负责报缺失
+    text = read(rep)
+
+    if "classify_uncovered" not in text:
+        fail("[coverage-reachability] tools/coverage_report.py 没有把未覆盖行按"
+             "可达性分类。只报『未覆盖 N 行』无法指导行动：第 26 轮实测 "
+             "fingerprint_hailin.cpp 的 234 行未覆盖里，204 行是**零调用者的"
+             "死代码**（baseline 亦然），只有 30 行真的可补。不分类就会把死代码"
+             "当成待办、把真缺口淹没。")
+        return
+
+    for pat, why in [
+        ("不可达", "未标注『不可达』这一类"),
+        ("可达未测", "未标注『可达未测』这一类"),
+    ]:
+        if pat not in text:
+            fail("[coverage-reachability] tools/coverage_report.py %s —— "
+                 "两类必须都显式输出，否则读者无法区分『基线没接线』与"
+                 "『有测试但没跑到』。" % why)
+
+
+
 def check_cross_repo_test_targets_are_unique(root, extra_root):
     """
     两个仓库的测试目标名必须互不冲突，否则**超级工程无法配置**。
@@ -2555,6 +2615,7 @@ def main():
     check_live_fingerprint_enroll_sequence_is_pinned(root, src_root)
     check_coverage_denominator_is_declared(root, src_root)
     check_tool_scripts_are_console_encoding_safe(root, src_root)
+    check_coverage_separates_dead_from_untested(root, src_root)
     check_fake_fingerprint_builds_same_bytes(root, src_root)
     check_fingerprint_checksum_logic_is_not_duplicated(root, src_root)
     check_gated_wire_paths_have_resume_test(root, src_root)
