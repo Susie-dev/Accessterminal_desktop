@@ -514,6 +514,76 @@ def check_deleted_on_close_members(root, src_root):
                                  raw_members[member]))
 
 
+def check_datagram_read_returns(root, src_root):
+    """
+    所有 UDP 收包都必须检查 readDatagram() / recvfrom() 的返回值。
+
+    背景（真实缺陷，本轮修复）：
+    `CallSession::onAudioDataReady()` 与 `onVideoDataReady()` 原本写成
+
+        QByteArray datagram;
+        datagram.resize(socket->pendingDatagramSize());
+        socket->readDatagram(datagram.data(), datagram.size(), ...);   // 返回值被丢弃
+
+    两个后果：
+      1) `QByteArray::resize()` **不清零**新分配的字节。若实际读到的字节数
+         少于 `pendingDatagramSize()`，尾部就是未初始化内存（或上一轮循环的
+         残留字节）。音频路径下它会被 append 后直接喂给声卡（噪声），
+         视频路径下会交给 `loadFromData()` 解码（垃圾数据/解码器崩溃）。
+      2) 返回 -1 表示读取失败，此时 `readDatagram` 不会填充
+         sender/senderPort 出参。音频路径若不判就赋值，会把“回传目标地址”
+         改成未初始化/上一次的地址，导致上行语音发错地方。
+
+    `pendingDatagramSize()` 返回 qint64 而非 int，因此这里统一要求：
+      - 抓到变量名，检查同函数内该变量有 `< 0` / `== -1` 之类的失败分支；
+      - 若读取时用了出参（&sender / &port），失败必须 `continue`/`return`
+        而不能继续使用出参。
+
+    只做“返回值是否被接收并判负”的结构检查，不推断语义。
+    """
+    for path in find_files(src_root, {".cpp"}):
+        text = strip_comments_and_strings(read(path))
+        rel = os.path.relpath(path, root)
+
+        # 逐个函数体检查
+        for fm in re.finditer(
+                r'^[\w:<>,\s\*&]+\b\w+\s*::\s*(\w+)\s*\([^;]*?\)\s*(?:const\s*)?\{',
+                text, re.M):
+            b0 = fm.end() - 1
+            depth, i = 0, b0
+            while i < len(text):
+                if text[i] == '{':
+                    depth += 1
+                elif text[i] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        break
+                i += 1
+            body = text[b0:i + 1]
+            line0 = text.count("\n", 0, b0) + 1
+
+            for m in re.finditer(
+                    r'(?:(?:const\s+)?\w+\s+(\w+)\s*=\s*)?'
+                    r'(\w+(?:->|\.)readDatagram\s*\(|(?<!\w)recvfrom\s*\()',
+                    body):
+                assignee, call = m.group(1), m.group(2)
+                call_line = line0 + body.count("\n", 0, m.start())
+                fn_name = fm.group(1)
+                if not assignee:
+                    fail("[datagram-ret] {}:{} 函数 {}() 调用了 {} 但丢弃了返回值；"
+                         "QByteArray::resize() 不清零，尾部可能是未初始化字节，"
+                         "且失败(-1)时出参未被填充。必须接收并检查返回值。"
+                         .format(rel, call_line, fn_name, call.strip()))
+                    continue
+                # 该赋值变量在后续是否被判负
+                tail = body[m.end():]
+                if not re.search(re.escape(assignee) + r'\s*(?:<\s*0|==\s*-1|!=\s*\w*\s*[!=])',
+                                 tail):
+                    fail("[datagram-ret] {}:{} 函数 {}() 接收了 {} 的返回值 '{}' "
+                         "但未见 <0 / ==-1 之类的失败判断。"
+                         .format(rel, call_line, fn_name, call.strip(), assignee))
+
+
 def main():
     if len(sys.argv) < 2:
         print("用法: python verify.py <项目根目录>")
@@ -535,6 +605,7 @@ def main():
     check_media_gated_by_answer(root, src_root)
     check_deleted_on_close_members(root, src_root)
     check_unqueued_poll_timers(root, src_root)
+    check_datagram_read_returns(root, src_root)
     check_json_configs(root)
 
     print(f"校验目录: {root}")

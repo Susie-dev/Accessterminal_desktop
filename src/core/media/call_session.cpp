@@ -196,8 +196,27 @@ void CallSession::onAudioDataReady()
         datagram.resize(static_cast<int>(m_audioSocket->pendingDatagramSize()));
         QHostAddress sender;
         quint16 senderPort = 0;
-        m_audioSocket->readDatagram(datagram.data(), datagram.size(),
-                                    &sender, &senderPort);
+
+        // 不能忽略 readDatagram 的返回值，两个理由：
+        //
+        // 1) QByteArray::resize() 不会清零新分配的字节。若实际读到的字节数
+        //    少于 pendingDatagramSize()，尾部就是未初始化内存（或上一轮循环
+        //    的残留），下面 append 进 m_audioBuffer 后会经 writeAudioData()
+        //    直接喂给声卡 —— 表现为刺耳的噪声，且不是重构前已有的行为。
+        // 2) 返回 -1 表示读取失败。此时 sender/senderPort 未被填充，若不判
+        //    就赋值，会把“回传目标地址”改成无效地址，导致后续上行语音
+        //    全部发错地方（或发不出）。
+        //
+        // 正常情况下 bytesRead == datagram.size()，行为与重构前完全一致。
+        // 与 monitor_client.cpp / 门口机 camera_preview_server.cpp 保持对称。
+        const qint64 bytesRead = m_audioSocket->readDatagram(
+            datagram.data(), datagram.size(), &sender, &senderPort);
+        if (bytesRead < 0) {
+            continue; // 读取失败，丢弃该数据报（不要污染设备地址）
+        }
+        if (bytesRead < datagram.size()) {
+            datagram.resize(static_cast<int>(bytesRead));
+        }
 
         // 只有收到过终端音频包，才知道回传目标地址。
         m_deviceAddress = sender;
@@ -252,7 +271,21 @@ void CallSession::onVideoDataReady()
     while (m_videoSocket->hasPendingDatagrams()) {
         QByteArray datagram;
         datagram.resize(static_cast<int>(m_videoSocket->pendingDatagramSize()));
-        m_videoSocket->readDatagram(datagram.data(), datagram.size());
+
+        // 不能忽略 readDatagram 的返回值：QByteArray::resize() 不会清零
+        // 新分配的内存。若实际读到的字节数少于 pendingDatagramSize()，
+        // 尾部就是未初始化字节（或上一次循环的残留），直接交给
+        // loadFromData() 会解析到垃圾数据，甚至触发解码器崩溃。
+        // 正常情况下返回值等于 datagram.size()，行为与重构前一致。
+        // 与 monitor_client.cpp / 门口机 camera_preview_server.cpp 保持对称。
+        const qint64 bytesRead =
+            m_videoSocket->readDatagram(datagram.data(), datagram.size());
+        if (bytesRead < 0) {
+            continue; // 读取失败，丢弃该数据报
+        }
+        if (bytesRead < datagram.size()) {
+            datagram.resize(static_cast<int>(bytesRead));
+        }
 
         // 每包一帧完整 JPEG，直接解码。
         QImage image;

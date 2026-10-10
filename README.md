@@ -200,6 +200,75 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 
 ---
 
+## 关键约定（由自动化检查强制）
+
+以下几条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+`tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
+
+### 1. 音视频通道只在接听后建立
+
+`CallSession` 的 socket / 音频设备必须在 `Form_phonecall::engageCall()`
+（即用户上滑接听）之后才创建，不能在待机时占用端口与设备。
+由 `check_media_gated_by_answer` 强制。
+
+### 2. `WA_DeleteOnClose` 的窗口不能存进裸指针成员
+
+设了 `WA_DeleteOnClose` 的窗口在 `close()` 时会被 Qt 直接销毁。若同时把
+它保存在裸指针成员里，成员随即悬垂，之后任何 `->` 都是 use-after-free。
+请改用 `QPointer<...>`（它在对象销毁时自动置空）。
+由 `check_deleted_on_close_members` 强制。
+
+### 3. 常驻轮询定时器必须可停
+
+周期性 `QTimer` 若只在局部变量里创建、又只由某个成功分支停止，就会永久空转。
+若回调里还有阻塞调用（如串口读），会持续卡住 GUI 线程。定时器要存成成员，
+并提供在退出/析构时调用的停止方法；分步之间的 `singleShot` 还要用代数令牌
+作废（避免退出后又被延时回调拉起来）。
+由 `check_unqueued_poll_timers` 强制。该检查**只覆盖 QWidget 子类**——
+随程序存活的 QObject 其常驻轮询是设计意图，不算缺陷。
+
+### 4. 收 UDP 包必须检查 `readDatagram()` / `recvfrom()` 的返回值
+
+先 `resize(pendingDatagramSize())` 再 `readDatagram(...)` 的写法里，
+**返回值不能丢**：
+
+```cpp
+QByteArray datagram;
+datagram.resize(socket->pendingDatagramSize());
+socket->readDatagram(datagram.data(), datagram.size(), &sender, &senderPort);
+```
+
+两个后果：
+
+1. `QByteArray::resize()` **不清零**新分配的字节。若实际读到的字节数少于
+   `pendingDatagramSize()`，尾部就是未初始化内存（或上一轮循环的残留字节）。
+   音频路径下它会被 append 后直接喂给声卡（噪声）；视频路径下会交给
+   `loadFromData()` 解码（垃圾数据，甚至解码器崩溃）。
+2. 返回 `-1` 表示读取失败，此时 `readDatagram` **不会填充** `sender`/`senderPort`
+   出参。音频路径若不判就赋值，会把“回传目标地址”改成未初始化（或上一次的）
+   地址，导致后续上行语音全部发错地方。
+
+注意 `pendingDatagramSize()` 返回 `qint64` 而非 `int`。
+
+正确写法（`monitor_client.cpp` 采用）：
+
+```cpp
+const qint64 bytesRead = m_socket->readDatagram(datagram.data(), datagram.size());
+if (bytesRead < 0) {
+    continue;                 // 失败：丢弃该数据报
+}
+if (bytesRead < datagram.size()) {
+    datagram.resize(static_cast<int>(bytesRead));
+}
+```
+
+由 `check_datagram_read_returns` 强制（覆盖 `readDatagram` 与 `recvfrom`）。
+
+用 `.clang-format` 统一格式，但**格式不是正确性**——上述四条请以
+`verify.py` 的结果为准。
+
+---
+
 ## 开发约定
 
 - **标准**：C++11
