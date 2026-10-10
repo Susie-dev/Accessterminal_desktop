@@ -133,12 +133,15 @@ def check_ui_objectnames(root, src_root):
         stem = os.path.splitext(os.path.basename(uipath))[0]
         # 找到引用该 ui 的 cpp（同目录同名，或 include "ui_xxx.h"）
         for cpp in find_files(src_root, {".cpp"}):
-            text = read(cpp)
-            if f"ui_{stem}.h" not in text and os.path.splitext(os.path.basename(cpp))[0] != stem:
+            raw = read(cpp)
+            if f"ui_{stem}.h" not in raw and os.path.splitext(os.path.basename(cpp))[0] != stem:
                 continue
             # 仅在确实使用 Ui::<Stem> 时校验
-            if f"Ui::{stem}" not in text and "setupUi" not in text:
+            if f"Ui::{stem}" not in raw and "setupUi" not in raw:
                 continue
+            # 只看真实代码：注释/字符串里的 `ui->xxx`（例如说明文字、被注释掉的
+            # 旧代码）不是对控件的引用，否则会产生误报。
+            text = strip_comments_and_strings(raw)
             used = set(re.findall(r"\bui->([A-Za-z_]\w*)", text))
             # setupUi/retranslateUi 是 uic 生成的方法，不是控件
             used -= {"setupUi", "retranslateUi"}
@@ -166,10 +169,23 @@ def strip_comments_and_strings(text):
     """
     去掉注释与字符串字面量，避免把注释里的示例当作真实代码。
     先处理块注释与字符串，最后处理行注释，避免相互干扰。
+
+    注意：被删除的片段若跨多行，必须**保留其中的换行符**，否则删除后的文本
+    行号会整体前移，所有基于 `text.count("\\n", 0, pos)` 的报错行号都会指向
+    错误位置。这里对块注释保留换行、其余字符换成空格；对字符串/字符字面量
+    保留首尾定界符与换行，仅清空内容（与既有行为一致）。
     """
-    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
-    text = re.sub(r'"(?:\\.|[^"\\])*"', '""', text)
-    text = re.sub(r"'(?:\\.|[^'\\])*'", "''", text)
+    def blank_keep_newlines(m):
+        return re.sub(r"[^\n]", " ", m.group(0))
+
+    def empty_string_keep_newlines(m):
+        s = m.group(0)
+        # 保留首尾定界符与内部换行，其余内容清空（与把字符串替换为 "" 等效）。
+        return s[0] + re.sub(r"[^\n]", "", s[1:-1]) + s[-1]
+
+    text = re.sub(r"/\*.*?\*/", blank_keep_newlines, text, flags=re.S)
+    text = re.sub(r'"(?:\\.|[^"\\])*"', empty_string_keep_newlines, text)
+    text = re.sub(r"'(?:\\.|[^'\\])*'", empty_string_keep_newlines, text)
     text = re.sub(r"//[^\n]*", "", text)
     return text
 
@@ -584,6 +600,117 @@ def check_datagram_read_returns(root, src_root):
                          .format(rel, call_line, fn_name, call.strip(), assignee))
 
 
+def check_connect_signal_is_signal(root, src_root):
+    """
+    connect() 的第二个实参必须是**信号**。
+
+    背景：Qt5 的 PMF 版 connect 会把第二个实参（成员指针）交给
+    `QObject::connectImpl()`，后者用 `QMetaObject::IndexOfMethod()` 反查信号索引，
+    而 moc **只为 `signals:` 区的成员生成信号索引**（槽/普通成员索引为 -1）。
+    把一个槽或普通成员当作信号源连接，运行期必然失败：Qt 打印
+    `QObject::connect: signal not found in <类名>`、connect 返回 false，
+    对应的槽永远不会被调用，那段业务逻辑是死代码。
+
+    注意：`connect(btn, &QPushButton::clicked, this, &Cls::someSlot)` 是完全正常的
+    （槽只需可调用，不必是信号）。所以本检查**只看第二个实参**：只有当
+    `&Cls::name` 中的 Cls 是本工程某个含 Q_OBJECT 的类、且 name 在该类的
+    **非 signals 区**被显式声明时，才判定为错误。
+
+    只看结构，不做语义推断；继承自基类的信号不予判定。
+    """
+    sig_re = r'^\s*(?:(?:public|private|protected)\s+)?(?:signals|Q_SIGNALS)\s*:'
+    slot_re = r'^\s*(?:(?:public|private|protected)\s+)?(?:slots|Q_SLOTS)\s*:'
+    acc_re = r'^\s*(?:public|private|protected)\s*:'
+    mem_re = r'^(?:[\w:<>,\*&\s]+?\s)?~?(\w+)\s*\('
+    skip = ("if", "for", "while", "switch", "return", "emit", "connect", "catch")
+
+    # 1) 收集所有含 Q_OBJECT 的类的成员分区
+    classes = {}
+    for hpath in find_files(src_root, {".h", ".hpp"}):
+        htext = strip_comments_and_strings(read(hpath))
+        for cm in re.finditer(r'\bclass\s+(\w+)\s*(?::[^{;]*)?\{', htext):
+            cname = cm.group(1)
+            start = cm.end() - 1
+            depth, i = 0, start
+            while i < len(htext):
+                if htext[i] == "{":
+                    depth += 1
+                elif htext[i] == "}":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                i += 1
+            body = htext[start + 1:i]
+            if "Q_OBJECT" not in body:
+                continue
+            signals, others = set(), set()
+            cur = others
+            for line in body.split("\n"):
+                if re.match(sig_re, line):
+                    cur = signals
+                    continue
+                if re.match(slot_re, line) or re.match(acc_re, line):
+                    cur = others
+                    continue
+                m = re.match(mem_re, line.strip())
+                if m and m.group(1) not in skip:
+                    cur.add(m.group(1))
+            classes[cname] = (signals, others)
+
+    if not classes:
+        return
+
+    # 2) 扫描 connect() 的第二个实参
+    for path in find_files(src_root, {".cpp"}):
+        text = strip_comments_and_strings(read(path))
+        rel = os.path.relpath(path, root)
+        for m in re.finditer(r'\bconnect\s*\(', text):
+            open_idx = m.end() - 1
+            depth, i = 0, open_idx
+            while i < len(text):
+                if text[i] == "(":
+                    depth += 1
+                elif text[i] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                i += 1
+            call = text[open_idx + 1:i]
+
+            # 按顶层逗号切分实参
+            args, depth2, cur = [], 0, ""
+            for ch in call:
+                if ch in "(<[":
+                    depth2 += 1
+                elif ch in ")>]":
+                    depth2 -= 1
+                if ch == "," and depth2 == 0:
+                    args.append(cur)
+                    cur = ""
+                else:
+                    cur += ch
+            if cur.strip():
+                args.append(cur)
+            if len(args) < 2:
+                continue
+
+            mm = re.search(r'&\s*(\w+)\s*::\s*(\w+)', args[1])
+            if not mm:
+                continue
+            cname, name = mm.group(1), mm.group(2)
+            if cname not in classes:
+                continue
+            signals, others = classes[cname]
+            if name in signals or name not in others:
+                continue
+            line = text.count("\n", 0, m.start()) + 1
+            fail("[connect-sig] {}:{} connect() 的第二个实参 &{}::{}() 不是信号"
+                 "（它声明在非 signals 区）；moc 不会为它生成信号索引，运行期 "
+                 "connect 必然失败并打印 \"signal not found in {}\"，"
+                 "对应槽是死代码。"
+                 .format(rel, line, cname, name, cname))
+
+
 def main():
     if len(sys.argv) < 2:
         print("用法: python verify.py <项目根目录>")
@@ -606,6 +733,7 @@ def main():
     check_deleted_on_close_members(root, src_root)
     check_unqueued_poll_timers(root, src_root)
     check_datagram_read_returns(root, src_root)
+    check_connect_signal_is_signal(root, src_root)
     check_json_configs(root)
 
     print(f"校验目录: {root}")

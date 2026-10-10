@@ -264,7 +264,28 @@ if (bytesRead < datagram.size()) {
 
 由 `check_datagram_read_returns` 强制（覆盖 `readDatagram` 与 `recvfrom`）。
 
-用 `.clang-format` 统一格式，但**格式不是正确性**——上述四条请以
+### 5. `connect()` 的第二个实参必须是信号
+
+Qt5 的 PMF 版 `connect` 会把第二个实参（成员函数指针）交给
+`QObject::connectImpl()`，后者用 `QMetaObject::IndexOfMethod()` 反查信号索引，
+而 **moc 只为 `signals:` 区声明的成员生成信号索引**（槽与普通成员索引为 `-1`）。
+因此把一个槽或普通成员当作信号源去连接，编译能过、运行期必然失败：
+
+```
+QObject::connect: signal not found in <类名>
+```
+
+`connect` 返回 `false`，**对应的槽永远不会被调用**——那段业务逻辑是死代码，
+而且不会有任何崩溃或报错提示，极难发现。
+
+注意区分：`connect(btn, &QPushButton::clicked, this, &Cls::someSlot)` 是**完全正常**
+的写法——槽只需可调用，不必是信号。本检查因此**只看第二个实参**。
+
+由 `check_connect_signal_is_signal` 强制：解析每个 `Q_OBJECT` 类的
+`signals:` / `slots:` / 访问权限分区，若 `&Cls::name` 中的 `name` 在该类的
+非 `signals` 区被显式声明，即报错。继承自 Qt 基类的信号不予判定。
+
+用 `.clang-format` 统一格式，但**格式不是正确性**——上述五条请以
 `verify.py` 的结果为准。
 
 ---
