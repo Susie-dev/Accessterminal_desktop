@@ -1554,6 +1554,201 @@ def check_narrowing_cast_of_config(root, src_root):
                  .format(rel, line, text[m.start():j + 1][:90]))
 
 
+WIRE_FORMAT_CONSTANTS = (
+    "kAudioSampleRate",
+    "kAudioChannels",
+    "kAudioBytesPerSample",
+    "kAudioFramesPerPacket",
+    "kSignalingPort",
+    "kAudioPort",
+    "kVideoPort",
+    "kPreviewPort",
+)
+
+
+def check_wire_format_constants_are_pinned(root, src_root):
+    """
+    影响线上字节格式的协议常量必须在 tests/ 里被断言。
+
+    注：本规则由 T113 仓库移植而来。两个仓库共享同一份 protocol.h，
+    室内机是 UDP 12345 的接收方，若包长/采样率常量被改动而测试无反应，
+    同样只表现为"声音不对"且不报错，所以这里也要钉住。
+
+    背景（真实的测试盲区，本轮补上）：
+    AudioSenderThread 决定 UDP 12345 的**字节格式**（裸 PCM、S16_LE、
+    16000 Hz、单声道、每包 320 帧 = 640 字节、**无包头**），室内机按包直接
+    喂给 ALSA，所以包长或字节序错一点，现场只表现为"声音不对/有杂音"，
+    **不报任何错误**。
+
+    它此前从未被真正验证过：tools/devstubs 的 sendto() 只"返回 len"、不留
+    痕迹，其 inet_pton() 还**永远返回 0**，导致 run() 在建连阶段就 return，
+    根本走不到发送代码——测试即使"绿"着，发送逻辑一行都没执行。
+
+    所以本检查要求：这些常量名必须出现在 tests/ 的源码里。它不能证明断言
+    写得好，但能保证"改了这些值而测试毫无反应"这种情况不会悄悄发生。
+    """
+    proto = os.path.join(src_root, "core", "net", "protocol.h")
+    if not os.path.isfile(proto):
+        FAIL.append(f"[wire-format] 找不到 {proto}")
+        return
+
+    text = strip_comments_and_strings(read(proto))
+    declared = set()
+    for m in re.finditer(r"constexpr\s+[\w:]+\s+(k\w+)\s*=", text):
+        declared.add(m.group(1))
+
+    tests_root = os.path.join(root, "tests")
+    if not os.path.isdir(tests_root):
+        FAIL.append("[wire-format] 找不到 tests 目录，无法验证协议常量是否被钉住")
+        return
+
+    test_text = []
+    for path in find_files(tests_root, (".cpp", ".h", ".hpp", ".c")):
+        test_text.append(strip_comments_and_strings(read(path)))
+    blob = "\n".join(test_text)
+
+    missing = [c for c in WIRE_FORMAT_CONSTANTS if c in declared and c not in blob]
+    if missing:
+        FAIL.append(
+            "[wire-format] 下列协议常量决定了线上字节格式，却没有任何测试断言它们："
+            + ", ".join(missing)
+            + " —— 改动它们不会让任何测试失败（详见 README 第 22 条）"
+        )
+
+
+def top_level_function_ranges(text):
+    """
+    返回 [(函数体起止下标, 函数体文本)]，只认**花括号深度为 0** 的函数定义。
+
+    为什么不用"由内向外回溯"：那条路要往前找上一个 `;`/`}`/`{` 作为签名起点，
+    而 `for (int i = 0; i < N; ++i)` 这类**头部含分号**的控制语句会把签名截断成
+    `++i)`，于是被误判成函数签名、函数体只截到内层块。第 18 轮的
+    `snd_pcm_writei` 正好包在这样一个 for 里，导致规则整处漏报（自检 4/6）。
+
+    只看深度 0 的块就能彻底避开这个问题：函数体一定是一个深度 0 的块，
+    块内嵌套的 for/if/lambda 都在深度 >= 1，不会被误认。
+    """
+    out = []
+    depth = 0
+    i = 0
+    opens = []
+    while i < len(text):
+        c = text[i]
+        if c == "{":
+            if depth == 0:
+                opens.append(i)
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0 and opens:
+                start = opens.pop()
+                out.append((start, i + 1, text[start:i + 1]))
+            if depth < 0:
+                depth = 0
+        i += 1
+    return out
+
+
+def enclosing_function_body(text, pos):
+    """返回包含 text[pos] 的**最内层顶层函数体**；找不到返回 None。"""
+    best = None
+    for start, end, body in top_level_function_ranges(text):
+        if start <= pos < end:
+            if best is None or start > best[0]:
+                best = (start, end, body)
+    return best[2] if best else None
+
+
+def top_level_function_ranges(text):
+    """
+    返回 [(函数体起止下标, 函数体文本)]，只认**花括号深度为 0** 的函数定义。
+
+    为什么不用"由内向外回溯"：那条路要往前找上一个 `;`/`}`/`{` 作为签名起点，
+    而 `for (int i = 0; i < N; ++i)` 这类**头部含分号**的控制语句会把签名截断成
+    `++i)`，于是被误判成函数签名、函数体只截到内层块。第 18 轮的
+    `snd_pcm_writei` 正好包在这样一个 for 里，导致规则整处漏报（自检 4/6）。
+
+    只看深度 0 的块就能彻底避开这个问题：函数体一定是一个深度 0 的块，
+    块内嵌套的 for/if/lambda 都在深度 >= 1，不会被误认。
+    """
+    out = []
+    depth = 0
+    i = 0
+    opens = []
+    while i < len(text):
+        c = text[i]
+        if c == "{":
+            if depth == 0:
+                opens.append(i)
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0 and opens:
+                start = opens.pop()
+                out.append((start, i + 1, text[start:i + 1]))
+            if depth < 0:
+                depth = 0
+        i += 1
+    return out
+
+
+def enclosing_function_body(text, pos):
+    """返回包含 text[pos] 的**最内层顶层函数体**；找不到返回 None。"""
+    best = None
+    for start, end, body in top_level_function_ranges(text):
+        if start <= pos < end:
+            if best is None or start > best[0]:
+                best = (start, end, body)
+    return best[2] if best else None
+
+
+def check_nonblock_pcm_handles_eagain(root, src_root):
+    """
+    以 SND_PCM_NONBLOCK 打开的 PCM 句柄，必须把 -EAGAIN 与真错误区分开。
+
+    背景（真实缺陷，第 18 轮修复）：
+    `AudioReceiverThread::run()` 里
+
+        snd_pcm_open(&pcm_handle, PCM_DEVICE,
+                     SND_PCM_STREAM_PLAYBACK, SND_PCM_NONBLOCK);
+
+    设备是**非阻塞**打开的，因此 `snd_pcm_writei` 返回 -EAGAIN（播放缓冲区
+    暂时满）是**完全可达的**正常情况，不是错误。原实现只特判 -EPIPE，其余
+    负值一律走 `rcw < 0` 分支 → emit errorMsg + 结束播放线程。
+    现场表现是**通话中途突然单向无声**，而 errorMsg 只打日志、界面毫无察觉。
+    对照实验（探针，600 ms 窗口）：修复前 connectionLost 发射 3410 次且线程
+    仍在运行；修复后恰好 1 次且线程结束。
+
+    反向也危险：`AudioSenderThread` 以同样方式打开**采集**句柄，
+    `snd_pcm_readi` 在缓冲区暂时没数据时同样返回 -EAGAIN；若把它当致命错误，
+    上行音频会随录音间隙中断（该线程已有处理，见 tests/test_audio_sender.cpp）。
+
+    判定：对每个 `snd_pcm_readi/writei` 调用，取其**所属函数体**；若该函数体内
+    以 SND_PCM_NONBLOCK 打开了 PCM 句柄，则该函数体内必须出现 EAGAIN 或
+    EWOULDBLOCK 字样。这是"有没有区分"的下限检查，不判断处理是否正确。
+    """
+    for path in find_files(src_root, (".cpp", ".cc", ".cxx")):
+        rel = os.path.relpath(path, root)
+        text = strip_comments_and_strings(read(path))
+        if "SND_PCM_NONBLOCK" not in text:
+            continue
+        for m in re.finditer(r"\b(snd_pcm_(?:readi|writei))\s*\(", text):
+            fn = m.group(1)
+            body = enclosing_function_body(text, m.start())
+            if body is None:
+                continue
+            if "SND_PCM_NONBLOCK" not in body:
+                continue
+            if "EAGAIN" in body or "EWOULDBLOCK" in body:
+                continue
+            fail("[nonblock-pcm] {} 里以 SND_PCM_NONBLOCK 打开 PCM 句柄后调用 {}，"
+                 "却没有在同一个函数体内处理 -EAGAIN/-EWOULDBLOCK。"
+                 "非阻塞句柄在缓冲区满/空时**必然**返回 -EAGAIN，把它当致命错误会"
+                 "让通话中途单向无声（下行）或随录音间隙中断（上行）。"
+                 "该值是可恢复的，应重试或丢弃本包后继续，而不是结束线程。"
+                 .format(rel, fn))
+
+
 def check_cross_repo_test_targets_are_unique(root, extra_root):
     """
     两个仓库的测试目标名必须互不冲突，否则**超级工程无法配置**。
@@ -1642,6 +1837,8 @@ def main():
     check_hex_parse_is_validated(root, src_root)
     check_load_state_reset(root, src_root)
     check_narrowing_cast_of_config(root, src_root)
+    check_wire_format_constants_are_pinned(root, src_root)
+    check_nonblock_pcm_handles_eagain(root, src_root)
     check_cross_repo_test_targets_are_unique(
         root, sys.argv[2] if len(sys.argv) > 2 else None)
 

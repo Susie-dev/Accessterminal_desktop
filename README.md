@@ -218,7 +218,7 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 
 ## 关键约定（由自动化检查强制）
 
-以下十六条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+以下十八条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
 `tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
 
 ### 1. 音视频通道只在接听后建立
@@ -581,12 +581,37 @@ ctest 用例名加仓库前缀（`desktop_` / `t113_`）后，超级工程 **5/5
 python3 tools/verify.py . ../Accessterminal_T113
 ```
 
-用 `.clang-format` 统一格式，但**格式不是正确性**——上述十六条请以
+用 `.clang-format` 统一格式，但**格式不是正确性**——上述十八条请以
 `verify.py` 的结果为准。
 
 
 
 ---
+
+### 17. 影响线上字节格式的协议常量必须被测试钉住
+
+两个仓库共享同一份 `protocol.h`。室内机是 UDP 12345 的**接收方**，按包直接把
+裸 PCM 喂给 ALSA，所以采样率、声道数、每包帧数这类常量错一点，现场只表现为
+"声音不对/有杂音"，**不报任何错误**。
+
+`verify.py` 的 `check_wire_format_constants_are_pinned` 要求
+`kAudioSampleRate` / `kAudioChannels` / `kAudioBytesPerSample` /
+`kAudioFramesPerPacket` / `kSignalingPort` / `kAudioPort` / `kVideoPort` /
+`kPreviewPort` 都必须出现在 `tests/` 的源码里。它不能证明断言写得好，但能保证
+"改了这些值而测试毫无反应"不会悄悄发生。自检见 `tools/verify_wire_format.py`（7/7）。
+
+### 18. 非阻塞打开的 PCM 句柄必须区分 `-EAGAIN` 与真错误
+
+`snd_pcm_open(..., SND_PCM_NONBLOCK)` 打开的句柄，在播放缓冲满或采集缓冲空时
+**必然**返回 `-EAGAIN`。这是**正常且可恢复**的状态，不是设备故障；当成一般
+错误处理会导致静默的单向无声。
+
+`verify.py` 的 `check_nonblock_pcm_handles_eagain` 会挑出"以非阻塞方式打开，
+却在同一函数体内完全没有提及 `EAGAIN`/`EWOULDBLOCK`"的读写调用点。它按
+**函数体**判定（不是整个文件），自检见 `tools/verify_nonblock_pcm.py`（6/6）。
+
+桌面端目前没有 ALSA 代码，该规则当前为空转；同步过来是为了将来加入播放逻辑时
+立刻生效，并且保证两个仓库的规则集合不漂移。
 
 ## 开发约定
 
@@ -612,7 +637,8 @@ python3 tools/check_signatures.py .
 #     check_declared_signal_is_emitted / check_connect_signal_is_signal /
 #     check_abandoned_async_tasks / check_subproject_cmake_is_selfcontained /
 #     check_hex_parse_is_validated / check_load_state_reset /
-#     check_narrowing_cast_of_config
+#     check_wire_format_constants_are_pinned /
+#     check_nonblock_pcm_handles_eagain / check_narrowing_cast_of_config
 #     做故障注入。静态规则写错会静默失效，必须证明它真能区分好坏代码。
 python3 tools/verify_config_sanity.py .
 python3 tools/verify_config_knobs.py .
@@ -623,6 +649,8 @@ python3 tools/verify_subcmake.py .
 python3 tools/verify_hex_parse.py .
 python3 tools/verify_config_state.py .
 python3 tools/verify_cross_target.py .
+python3 tools/verify_wire_format.py .
+python3 tools/verify_nonblock_pcm.py .
 
 # 3. 跨仓库协议一致性
 python3 tools/check_protocol_sync.py
