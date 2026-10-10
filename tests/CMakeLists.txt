@@ -45,18 +45,18 @@ endif()
 # ---------------------------------------------------------------------------
 # 协议契约测试
 # ---------------------------------------------------------------------------
-add_executable(test_protocol test_protocol.cpp)
+add_executable(desktop_test_protocol test_protocol.cpp)
 
-target_include_directories(test_protocol PRIVATE
+target_include_directories(desktop_test_protocol PRIVATE
     ${ACCESSTERMINAL_SRC_ROOT}
 )
 
-target_link_libraries(test_protocol PRIVATE
+target_link_libraries(desktop_test_protocol PRIVATE
     Qt5::Core
     Qt5::Test
 )
 
-add_test(NAME protocol COMMAND test_protocol)
+add_test(NAME desktop_protocol COMMAND desktop_test_protocol)
 
 # ---------------------------------------------------------------------------
 # 配置解析测试（灯控指令十六进制解析）
@@ -64,18 +64,18 @@ add_test(NAME protocol COMMAND test_protocol)
 # 这是本工程第二个单元测试目标，需要链接真实的 src/config/app_config.cpp。
 # 不依赖硬件/网络，可在无串口的开发机上完整运行。
 # ---------------------------------------------------------------------------
-add_executable(test_app_config
+add_executable(desktop_test_app_config
     test_app_config.cpp
     ${ACCESSTERMINAL_SRC_ROOT}/config/app_config.cpp
 )
 
-target_include_directories(test_app_config PRIVATE
+target_include_directories(desktop_test_app_config PRIVATE
     ${ACCESSTERMINAL_SRC_ROOT}
 )
 
-target_link_libraries(test_app_config PRIVATE
+target_link_libraries(desktop_test_app_config PRIVATE
     Qt5::Core
     Qt5::Test
 )
 
-add_test(NAME app_config COMMAND test_app_config)
+add_test(NAME desktop_app_config COMMAND desktop_test_app_config)

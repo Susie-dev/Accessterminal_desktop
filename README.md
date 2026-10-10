@@ -218,7 +218,7 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 
 ## 关键约定（由自动化检查强制）
 
-以下十三条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+以下十六条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
 `tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
 
 ### 1. 音视频通道只在接听后建立
@@ -516,8 +516,75 @@ return QByteArray::fromHex(compact.toLatin1());
 `tests/test_app_config.cpp` 直接用真实 Qt 跑出上表的结果，把 Qt 的语义钉死
 （若将来 Qt 改变该行为，测试会失败并提醒重新评估守卫是否仍必要）。
 
-用 `.clang-format` 统一格式，但**格式不是正确性**——上述十三条请以
+### 14. 配置载入必须在每次调用开头复位"已载入"状态
+
+`AppConfig` 是**单例**且 `load()` 可被多次调用。原实现只在成功分支里写
+`m_loadedFromFile = true`，末尾却 `return m_loadedFromFile;`，而
+`applyDefaults()` 只重置各字段、**不复位该标志**：
+
+```cpp
+load(好文件)   // -> true
+load(坏文件)   // 解析失败走 continue，标志仍是 true -> 返回 true！
+load(不存在)   // 同样返回 true，configPath() 还指向早已失效的旧文件
+```
+
+实测（真实 Qt）确认：`load(bad)` 返回 true 且 `configPath()` 仍是上一个文件。
+调用方据此认为"配置已按文件生效"，实际用的是内置默认值 —— 一个会误导现场
+排查的错误返回值。
+
+修法是在函数开头显式复位 `m_loadedFromFile = false; m_configPath.clear();`。
+门口机侧用的是**函数局部** `bool fileLoaded = false;`，天然无此问题 ——
+正是这个不对称让本缺陷一直没被发现，故两个仓库都保留该检查。
+
+### 15. 配置整数转窄类型前必须先夹取
+
+```cpp
+m_signalingPort = static_cast<quint16>(jsonInt(net, "signaling_port", ...));
+```
+
+`static_cast` 到 `quint16` 是**取模截断**，不是夹取。实测（真实 Qt）：
+
+| 配置值 | 取模结果 | 应该 |
+| --- | --- | --- |
+| 65536 | **0** → 随机临时端口 | 65535 |
+| 999999 | **16959** | 65535 |
+| -1 | **65535** | 1 |
+| -5 | **65531** | 1 |
+
+用户写 `65536`/`-1` 这类"明显想表达边界"的值时，得到的是能成功监听的**错误
+端口**：门口机连不上，而日志显示监听正常。必须先 `clampInt(..., 1, 65535)`
+再转换；环境变量路径同理（`toUShort()` 对非法文本返回 0，`static_cast` 同样
+会取模）。
+
+两条均由 `check_load_state_reset` / `check_narrowing_cast_of_config` 强制，
+自检见 `tools/verify_config_state.py`（7/7）。
+
+### 16. 两个仓库的测试目标名必须唯一
+
+门口机与室内机各有 `tests/CMakeLists.txt`，目标名原本都是 `test_protocol`、
+`test_app_config`。单独构建都好，但把两个仓库作为子目录放进**同一个** CMake
+工程（跨仓库集成，或 IDE 一次性载入）时直接配置失败：
+
+```
+add_executable cannot create target "test_protocol" because another
+target with the same name already exists.
+```
+
+实测：修复前 `configure_rc=1`，两个 `add_executable` 全部失败；给目标名与
+ctest 用例名加仓库前缀（`desktop_` / `t113_`）后，超级工程 **5/5 用例通过**。
+`add_test(NAME ...)` 的用例名同理——重名会让 `ctest -R` 一次选中两个。
+
+由 `check_cross_repo_test_targets_are_unique` 强制（需传入另一仓库根目录，
+见 `tools/verify_cross_target.py`，5/5）：
+
+```bash
+python3 tools/verify.py . ../Accessterminal_T113
+```
+
+用 `.clang-format` 统一格式，但**格式不是正确性**——上述十六条请以
 `verify.py` 的结果为准。
+
+
 
 ---
 
@@ -544,7 +611,8 @@ python3 tools/check_signatures.py .
 # 2b. 校验器自检：对 check_config_value_sanity / check_config_knobs_are_used /
 #     check_declared_signal_is_emitted / check_connect_signal_is_signal /
 #     check_abandoned_async_tasks / check_subproject_cmake_is_selfcontained /
-#     check_hex_parse_is_validated
+#     check_hex_parse_is_validated / check_load_state_reset /
+#     check_narrowing_cast_of_config
 #     做故障注入。静态规则写错会静默失效，必须证明它真能区分好坏代码。
 python3 tools/verify_config_sanity.py .
 python3 tools/verify_config_knobs.py .
@@ -553,6 +621,8 @@ python3 tools/verify_connect_signal.py .
 python3 tools/verify_abandoned_task.py .
 python3 tools/verify_subcmake.py .
 python3 tools/verify_hex_parse.py .
+python3 tools/verify_config_state.py .
+python3 tools/verify_cross_target.py .
 
 # 3. 跨仓库协议一致性
 python3 tools/check_protocol_sync.py

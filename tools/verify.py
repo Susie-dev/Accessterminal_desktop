@@ -1428,9 +1428,190 @@ def check_hex_parse_is_validated(root, src_root):
                      .format(rel, line, fm.group(1), arg[:40]))
 
 
+def check_load_state_reset(root, src_root):
+    """
+    配置载入函数必须在**每次调用开头**复位"是否已载入"状态。
+
+    背景（真实缺陷，本轮修复）：
+    `AppConfig` 是单例且 `load()` 可被多次调用。原实现只在成功分支里写
+    `m_loadedFromFile = true`，却在函数末尾 `return m_loadedFromFile;`。
+    applyDefaults() 只重置各字段，**不复位该标志**，于是：
+
+        load(好文件) -> true
+        load(坏文件) -> 解析失败走 continue，标志仍是 true -> **返回 true**
+        load(不存在) -> 同样返回 true，configPath() 还指向早已失效的旧路径
+
+    实测（真实 Qt）确认：load(bad) 返回 true 且 configPath 仍是上一个文件。
+    调用方会据此认为"配置已按文件生效"，实际用的是内置默认值。
+
+    判定规则：若某函数名形如 load/readConfig/parseConfig，体内有
+    "<成员> = true/false" 这类标志赋值，且**末尾 return 该成员**，但函数开头
+    （首个赋值之前）没有把它复位为 false，即报错。
+
+    门口机侧使用**函数局部** `bool fileLoaded = false;`，天然无此问题 ——
+    正是这个不对称让室内机的缺陷一直没被发现，故两仓库都保留本检查。
+    """
+    for path in find_files(src_root, {".cpp"}):
+        text = strip_comments_and_strings(read(path))
+        rel = os.path.relpath(path, root)
+        funcs = list(re.finditer(
+            r'^[^\n{};#]*?\b(\w+)\s*\([^;{}]*\)\s*(?:const\s*)?\{', text, re.M))
+        for fm in funcs:
+            name = fm.group(1)
+            if name.lower() not in ("load", "readconfig", "parseconfig",
+                                    "reload", "loadconfig"):
+                continue
+            start = fm.end() - 1
+            depth, i = 0, start
+            while i < len(text):
+                if text[i] == '{':
+                    depth += 1
+                elif text[i] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        break
+                i += 1
+            body = text[start:i + 1]
+            line = text.count("\n", 0, fm.start()) + 1
+            # 末尾 return 的是某个成员（m_xxx）
+            mret = re.search(r'return\s+(m_\w+)\s*;', body)
+            if not mret:
+                continue
+            member = mret.group(1)
+            # 该成员被赋过值
+            assigns = list(re.finditer(
+                r'\b' + re.escape(member) + r'\s*=\s*(true|false)\s*;', body))
+            if not assigns:
+                continue
+            # 以**首个赋值为 true** 的位置为界，看它之前有没有复位为 false。
+            # 注意不能拿"第一个赋值"当界——那样复位语句本身就成了界，
+            # head 恒为空，规则会把正确代码也判为缺陷（首版正是这个错误，
+            # 由故障注入的"开头复位(真阴性)"用例抓出）。
+            set_true = None
+            for a in assigns:
+                if a.group(1) == "true":
+                    set_true = a
+                    break
+            if set_true is None:
+                continue  # 从未置 true，不存在残留问题
+            head = body[:set_true.start()]
+            if re.search(r'\b' + re.escape(member) + r'\s*=\s*false\s*;', head):
+                continue
+            fail("[load-state] {}:{} {}() 末尾 return {}，但函数开头没有把它"
+                 "复位为 false。该成员是单例状态，多次调用 load() 时失败路径"
+                 "不会清零它，于是 load(坏文件) 会返回 true（上一次成功的残留），"
+                 "调用方误以为配置已生效。请在函数开头显式复位"
+                 "（并一并清理 configPath 之类的状态）。"
+                 .format(rel, line, name, member))
+
+
+def check_narrowing_cast_of_config(root, src_root):
+    """
+    配置整数转窄类型前必须先夹取，不能直接 static_cast。
+
+    背景（真实缺陷，本轮修复）：
+    `m_signalingPort = static_cast<quint16>(jsonInt(..., "signaling_port", ...))`
+    —— `static_cast` 到 quint16 是**取模截断**而不是夹取。实测（真实 Qt）：
+
+        65536  -> 0      （=> QTcpServer 绑定随机临时端口）
+        999999 -> 16959
+        -1     -> 65535
+        -5     -> 65531
+
+    用户写 65536/-1 这类"明显想表达边界"的值时，得到的是能成功监听的**错误
+    端口**：门口机连不上，而日志显示监听正常。必须在 cast 之前用 clampInt。
+
+    判定规则：`static_cast<quint16|quint8|qint16|qint8|char|short>(...)` 的实参
+    里若直接调用 jsonInt/toInt/toUShort/toUInt 等**未夹取**的读取函数，即报错。
+    传入 clampInt(...) 的写法不受影响。
+    """
+    narrow = r'(?:quint16|quint8|qint16|qint8|uint16_t|uint8_t|int16_t|int8_t|char|short|unsigned\s+short)'
+    readfn = r'(?:jsonInt|jsonDouble|toInt|toUInt|toUShort|toULongLong|toLongLong)'
+    for path in find_files(src_root, {".cpp"}):
+        text = strip_comments_and_strings(read(path))
+        rel = os.path.relpath(path, root)
+        for m in re.finditer(r'static_cast\s*<\s*' + narrow + r'\s*>\s*\(', text):
+            open_idx = m.end() - 1
+            depth, j = 0, open_idx
+            while j < len(text):
+                if text[j] == '(':
+                    depth += 1
+                elif text[j] == ')':
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            arg = text[open_idx + 1:j]
+            if not re.search(r'\b' + readfn + r'\s*\(', arg):
+                continue
+            if re.search(r'\bclampInt\s*\(|\bclampDouble\s*\(', arg):
+                continue
+            line = text.count("\n", 0, m.start()) + 1
+            fail("[narrow-cast] {}:{} static_cast 到窄整型前没有夹取：{}"
+                 "static_cast 是**取模截断**而非夹取（65536 -> 0、-1 -> 65535、"
+                 "999999 -> 16959），越界配置会变成\"能用的错误值\"，比直接报错"
+                 "更难发现。请先 clampInt(..., lo, hi) 再转换。"
+                 .format(rel, line, text[m.start():j + 1][:90]))
+
+
+def check_cross_repo_test_targets_are_unique(root, extra_root):
+    """
+    两个仓库的测试目标名必须互不冲突，否则**超级工程无法配置**。
+
+    背景（真实缺陷，本轮修复）：
+    门口机与室内机各自有 tests/CMakeLists.txt，目标名原本都是 test_protocol、
+    test_app_config。单独构建时看不出问题，但把两个仓库作为子目录放进同一个
+    CMake 工程（跨仓库集成、或 IDE 一次性载入）时，CMake 直接报错：
+
+        add_executable cannot create target "test_protocol" because another
+        target with the same name already exists.
+
+    实测：修复前 configure_rc=1，两个 add_executable 全都失败；加仓库前缀后
+    5/5 用例通过。ctest 的**用例名**同理（add_test(NAME ...)）：重名会让
+    `ctest -R` 一次选中两个，输出也难以区分。
+
+    判定规则：分别收集两个仓库 tests/ 下的 add_executable 与 add_test 名字，
+    有交集即报错。
+    """
+    if not extra_root:
+        return
+    roots = [("本仓库", root),
+             ("另一仓库", os.path.abspath(extra_root))]
+
+    collected = {}
+    for label, repo in roots:
+        p = os.path.join(repo, "tests", "CMakeLists.txt")
+        if not os.path.isfile(p):
+            continue
+        text = strip_comments_and_strings(read(p))
+        collected[label] = (
+            set(re.findall(r'add_executable\s*\(\s*([\w.-]+)', text)),
+            set(re.findall(r'add_test\s*\(\s*NAME\s+([\w.-]+)', text)))
+
+    if len(collected) < 2:
+        return
+
+    items = list(collected.items())
+    for i in range(len(items)):
+        for j in range(i + 1, len(items)):
+            la, (ta, ca) = items[i]
+            lb, (tb, cb) = items[j]
+            dup_t = ta & tb
+            if dup_t:
+                fail("[cross-target] {} 与 {} 的测试可执行目标重名: {}。"
+                     "把两个仓库放进同一个 CMake 工程时会直接配置失败"
+                     "（add_executable cannot create target ...）。"
+                     "请给目标名加仓库前缀（如 t113_/desktop_）。"
+                     .format(la, lb, ", ".join(sorted(dup_t))))
+            dup_c = ca & cb
+            if dup_c:
+                fail("[cross-target] {} 与 {} 的 ctest 用例名重名: {}。"
+                     "重名会让 ctest -R 一次选中两个、输出难以区分。"
+                     "请给用例名加仓库前缀。".format(la, lb, ", ".join(sorted(dup_c))))
+
 def main():
     if len(sys.argv) < 2:
-        print("用法: python verify.py <项目根目录>")
+        print("用法: python verify.py <项目根目录> [另一仓库根目录]")
         return 2
     root = os.path.abspath(sys.argv[1])
     src_root = os.path.join(root, "src")
@@ -1459,6 +1640,10 @@ def main():
     check_declared_signal_is_emitted(root, src_root)
     check_abandoned_async_tasks(root, src_root)
     check_hex_parse_is_validated(root, src_root)
+    check_load_state_reset(root, src_root)
+    check_narrowing_cast_of_config(root, src_root)
+    check_cross_repo_test_targets_are_unique(
+        root, sys.argv[2] if len(sys.argv) > 2 else None)
 
     print(f"校验目录: {root}")
     print("=" * 70)

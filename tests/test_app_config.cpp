@@ -36,7 +36,189 @@ private slots:
     void rejectsEmptyAndGarbage();
     void acceptsValidForms();
     void badCommandKeepsDefaultInsteadOfCorrupting();
+
+    // ---- 数值配置兜底（与门口机对称；第 8/9 轮的缺陷类别）----
+    void clampHelpersBoundaries();
+    void signalingPortNeverZeroOrOutOfRange();
+    void ringtoneVolumeStaysInRange();
+    void legalNumericValuesPassThroughUnchanged();
+    void brokenJsonKeepsDefaults();
+    void reloadResetsLoadedState();
 };
+
+/**
+ * 数值兜底：本工程的 `signalingPort()` / `ringtoneVolume()` 与门口机的
+ * `faceDetectInterval()` 属于同一类问题 —— 配置是不可信输入，越界值必须在
+ * **取值出口**被夹住。门口机那边一个 0 值直接导致取模除零（SIGFPE 崩溃），
+ * 这里侧重"端口 0 会让 QTcpServer 绑到随机临时端口，门口机永远连不上且
+ * 日志看不出原因"。
+ */
+void TestAppConfig::clampHelpersBoundaries()
+{
+    using accessterminal::clampInt;
+
+    QCOMPARE(clampInt(5, 1, 10), 5);
+    QCOMPARE(clampInt(1, 1, 10), 1);    // 等于下界：不变
+    QCOMPARE(clampInt(10, 1, 10), 10);  // 等于上界：不变
+    QCOMPARE(clampInt(0, 1, 10), 1);
+    QCOMPARE(clampInt(-999, 1, 10), 1);
+    QCOMPARE(clampInt(11, 1, 10), 10);
+    QCOMPARE(clampInt(INT_MIN, 1, 10), 1);
+    QCOMPARE(clampInt(INT_MAX, 1, 10), 10);
+}
+
+/// 信令端口在**任何**输入下都不得为 0，也不得超出 quint16。
+void TestAppConfig::signalingPortNeverZeroOrOutOfRange()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+
+    // 期望值按 clampInt 语义（夹取），**不是** static_cast<quint16 的取模：
+    // 修复前实测 65536 -> 0、999999 -> 16959、-1 -> 65535、-5 -> 65531，
+    // 即"能成功监听的错误端口"，是本轮修掉的真实缺陷。
+    const struct { const char* json; quint16 expect; } cases[] = {
+        {"{\"network\":{\"signaling_port\":8887}}", 8887},
+        {"{\"network\":{\"signaling_port\":0}}", 1},        // 0 -> 随机端口，必须夹到 1
+        {"{\"network\":{\"signaling_port\":-1}}", 1},       // 不是 65535
+        {"{\"network\":{\"signaling_port\":-5}}", 1},       // 不是 65531
+        {"{\"network\":{\"signaling_port\":65535}}", 65535},
+        {"{\"network\":{\"signaling_port\":65536}}", 65535}, // 不是 0
+        {"{\"network\":{\"signaling_port\":999999}}", 65535},// 不是 16959
+    };
+    for (const auto& c : cases) {
+        const QString path = dir.filePath(QStringLiteral("cfg.json"));
+        QFile f(path);
+        QVERIFY(f.open(QIODevice::WriteOnly));
+        f.write(c.json);
+        f.close();
+
+        AppConfig& cfg = AppConfig::instance();
+        cfg.load(path);
+        QCOMPARE(cfg.signalingPort(), c.expect);
+        // 硬性不变量：端口永不为 0（否则 QTcpServer 绑到随机临时端口）
+        QVERIFY2(cfg.signalingPort() != 0, "signalingPort()==0 会让监听端口随机");
+    }
+}
+
+/// 铃声音量必须落在 QMediaPlayer::setVolume 的有效区间 [0,100]。
+void TestAppConfig::ringtoneVolumeStaysInRange()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+
+    const struct { const char* json; int expect; } cases[] = {
+        {"{\"media\":{\"ringtone_volume\":0}}", 0},
+        {"{\"media\":{\"ringtone_volume\":50}}", 50},
+        {"{\"media\":{\"ringtone_volume\":100}}", 100},
+        {"{\"media\":{\"ringtone_volume\":101}}", 100},
+        {"{\"media\":{\"ringtone_volume\":-20}}", 0},
+    };
+    for (const auto& c : cases) {
+        const QString path = dir.filePath(QStringLiteral("cfg.json"));
+        QFile f(path);
+        QVERIFY(f.open(QIODevice::WriteOnly));
+        f.write(c.json);
+        f.close();
+
+        AppConfig& cfg = AppConfig::instance();
+        cfg.load(path);
+        QCOMPARE(cfg.ringtoneVolume(), c.expect);
+        QVERIFY(cfg.ringtoneVolume() >= 0 && cfg.ringtoneVolume() <= 100);
+    }
+}
+
+/// 合法配置必须原样通过兜底（加了下限不能改变正常行为）。
+void TestAppConfig::legalNumericValuesPassThroughUnchanged()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+    const QString path = dir.filePath(QStringLiteral("cfg.json"));
+    QFile f(path);
+    QVERIFY(f.open(QIODevice::WriteOnly));
+    f.write("{\"network\":{\"signaling_port\":8887},"
+            "\"media\":{\"ringtone_volume\":80}}");
+    f.close();
+
+    AppConfig& cfg = AppConfig::instance();
+    QVERIFY(cfg.load(path));
+    QCOMPARE(cfg.signalingPort(), static_cast<quint16>(8887));
+    QCOMPARE(cfg.ringtoneVolume(), 80);
+    // 默认端口必须仍是协议冻结值 8887
+    cfg.load(QStringLiteral("/nonexistent/definitely-missing.json"));
+    QCOMPARE(cfg.signalingPort(), static_cast<quint16>(8887));
+}
+
+/// JSON 损坏时必须整体回退默认值，不留"半套"配置。
+void TestAppConfig::brokenJsonKeepsDefaults()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+
+    const QByteArray broken[] = {"{ this is not json", "[1,2,3]", ""};
+    for (const QByteArray& b : broken) {
+        const QString path = dir.filePath(QStringLiteral("cfg.json"));
+        QFile f(path);
+        QVERIFY(f.open(QIODevice::WriteOnly));
+        f.write(b);
+        f.close();
+
+        AppConfig& cfg = AppConfig::instance();
+        QVERIFY(!cfg.load(path));
+        QCOMPARE(cfg.signalingPort(), static_cast<quint16>(8887));
+        QCOMPARE(cfg.ringtoneVolume(), 100);
+        // 灯控默认值必须完好
+        QCOMPARE(cfg.lightCommand(QStringLiteral("desk")).toHex(),
+                 QByteArray("fd034c12045ddf"));
+    }
+}
+
+/**
+ * 回归（本轮修复）：单例的 load() 必须**每次**复位"已载入"状态。
+ *
+ * 修复前：先 load(好文件) 成功会把 m_loadedFromFile 置 true，之后再
+ * load(坏文件) 时没有任何分支复位它，函数末尾 `return m_loadedFromFile;`
+ * 于是返回 **true**，而 configPath() 仍指向早已不生效的旧路径。调用方会
+ * 以为"配置已按文件生效"，实际用的是内置默认值。
+ */
+void TestAppConfig::reloadResetsLoadedState()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+
+    const QString good = dir.filePath(QStringLiteral("good.json"));
+    QFile gf(good);
+    QVERIFY(gf.open(QIODevice::WriteOnly));
+    gf.write("{\"network\":{\"self_ip\":\"1.2.3.4\"}}");
+    gf.close();
+
+    const QString bad = dir.filePath(QStringLiteral("bad.json"));
+    QFile bf(bad);
+    QVERIFY(bf.open(QIODevice::WriteOnly));
+    bf.write("{ broken");
+    bf.close();
+
+    AppConfig& cfg = AppConfig::instance();
+
+    // 1) 好文件：成功，且路径更新
+    QVERIFY(cfg.load(good));
+    QCOMPARE(cfg.selfIp(), QStringLiteral("1.2.3.4"));
+    QCOMPARE(cfg.configPath(), good);
+
+    // 2) 坏文件：必须返回 false，且不残留上一个路径
+    QVERIFY2(!cfg.load(bad), "坏文件之后 load() 仍返回 true（状态未复位）");
+    QCOMPARE(cfg.selfIp(), QStringLiteral("192.168.1.4"));   // 回落默认
+    QVERIFY2(cfg.configPath().isEmpty(),
+             "load() 失败后 configPath() 仍指向旧文件，会误导现场排查");
+
+    // 3) 不存在的文件：同样 false
+    QVERIFY(!cfg.load(QStringLiteral("/nonexistent/definitely-missing.json")));
+    QVERIFY(cfg.configPath().isEmpty());
+
+    // 4) 再次载入好文件必须恢复正常
+    QVERIFY(cfg.load(good));
+    QCOMPARE(cfg.configPath(), good);
+    QCOMPARE(cfg.selfIp(), QStringLiteral("1.2.3.4"));
+}
 
 /// 内置默认灯控指令必须与重构前的 hexArray* 逐字节一致。
 void TestAppConfig::defaultsMatchBaseline()

@@ -163,6 +163,21 @@ static QStringList defaultConfigCandidates()
 bool AppConfig::load(const QString& filePath)
 {
     applyDefaults();
+    // 关键：每次 load() 都必须把"是否已从文件载入"复位。
+    //
+    // applyDefaults() 只重置各字段，不碰 m_loadedFromFile / m_configPath。
+    // 而 AppConfig 是**单例**且 load() 可被多次调用（测试里很常见，现场
+    // 也可能重载），于是：
+    //   1) 先 load(好文件) 成功 -> m_loadedFromFile = true；
+    //   2) 再 load(坏文件)     -> 解析失败走 continue，**没有任何分支复位**
+    //      这个标志，函数末尾 `return m_loadedFromFile;` 于是返回 **true**；
+    //   3) 再 load(不存在的文件) -> 同样返回 true，configPath() 还指向那个
+    //      早已不生效的旧路径。
+    // 实测（真实 Qt）：load(bad) 返回 true 且 configPath 仍是上一个文件。
+    // 调用方会据此认为"配置已按文件生效"，而实际用的是内置默认值 —— 一个会
+    // 误导现场排查的错误返回值。
+    m_loadedFromFile = false;
+    m_configPath.clear();
 
     QStringList candidates;
     if (!filePath.isEmpty()) {
@@ -198,8 +213,15 @@ bool AppConfig::load(const QString& filePath)
         const QJsonObject net = jsonObject(root, QStringLiteral("network"));
         m_selfIp = jsonString(net, QStringLiteral("self_ip"), m_selfIp);
         m_deviceIp = jsonString(net, QStringLiteral("device_ip"), m_deviceIp);
+        // 不能直接 static_cast<quint16>：那是**取模截断**而非夹取。
+        // 实测（真实 Qt）：signaling_port = 65536 -> 0（=> 随机临时端口），
+        // 999999 -> 16959，-1 -> 65535，-5 -> 65531。用户写成 65536/-1 这种
+        // "明显想表达边界"的值时，得到的却是能成功监听的**错误端口** ——
+        // 门口机连不上，而日志显示监听正常，极难定位。
+        // 先按 int 读入并夹到 [1, 65535]，再交给 quint16。
         m_signalingPort = static_cast<quint16>(
-            jsonInt(net, QStringLiteral("signaling_port"), m_signalingPort));
+            clampInt(jsonInt(net, QStringLiteral("signaling_port"), m_signalingPort),
+                     1, 65535));
 
         const QJsonObject hw = jsonObject(root, QStringLiteral("hardware"));
         m_serialPortName = jsonString(hw, QStringLiteral("serial_port"), m_serialPortName);
@@ -242,10 +264,25 @@ void AppConfig::applyEnvironment()
     // 统一前缀：新部署建议使用这一组。
     envOverride("ACCESSTERMINAL_NETWORK_SELF_IP", m_selfIp, toQString);
     envOverride("ACCESSTERMINAL_NETWORK_DEVICE_IP", m_deviceIp, toQString);
+    // 端口同样要先夹取再转 quint16。toUShort() 对非法文本返回 0，而
+    // static_cast<quint16> 会把 >=65536 的输入取模成小端口（65536 -> 0）。
+    // 走 accessterminal::clampInt 的同一套规则，与 JSON 路径保持一致。
     envOverride("ACCESSTERMINAL_NETWORK_SIGNALING_PORT", m_signalingPort,
-                [](const QByteArray& v) { return static_cast<quint16>(v.toUShort()); });
+                [this](const QByteArray& v) {
+                    bool ok = false;
+                    const int raw = v.toInt(&ok);
+                    return static_cast<quint16>(
+                        clampInt(ok ? raw : m_signalingPort, 1, 65535));
+                });
     envOverride("ACCESSTERMINAL_HARDWARE_SERIAL_PORT", m_serialPortName, toQString);
     envOverride("ACCESSTERMINAL_WEATHER_URL", m_weatherUrl, toQString);
+    // 铃声音量：合法区间 [0,100]，非法文本 -> 0（静音，安全侧）。
+    envOverride("ACCESSTERMINAL_MEDIA_RINGTONE_VOLUME", m_ringtoneVolume,
+                [](const QByteArray& v) {
+                    bool ok = false;
+                    const int raw = v.toInt(&ok);
+                    return clampInt(ok ? raw : 0, 0, 100);
+                });
 }
 
 QByteArray AppConfig::lightCommand(const QString& name) const
