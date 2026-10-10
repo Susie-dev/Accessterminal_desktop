@@ -384,6 +384,136 @@ def check_media_gated_by_answer(root, src_root):
                  .format(rel, text.count("\n", 0, pos) + 1))
 
 
+def check_unqueued_poll_timers(root, src_root):
+    """
+    轮询定时器不得以「无句柄」的局部变量创建。
+
+    背景（真实缺陷，来自 baseline，已修复）：Form_finger::startFingerRegisterStep()
+    里写的是
+
+        QTimer* timer = new QTimer(this);      // 局部变量，没有任何成员保存它
+        connect(timer, &QTimer::timeout, this, [=]{ ... });
+        timer->start(500);
+
+    这个轮询回调里做的是**阻塞串口读**且跑在 GUI 线程。只有“检测到手指”
+    那一条路径会 stop 它；用户点『退出』（onAddQuitClicked 只调 close()）时
+    定时器仍在跑。由于 Form_finger 没有设 WA_DeleteOnClose，close() 只是隐藏
+    窗口、对象还活着，于是：每 500ms 在 GUI 线程上阻塞一次，界面永久卡顿。
+
+    判定规则只针对「可被 close() 隐藏、但对象仍存活」的窗口类：
+      - 该类必须继承 QWidget，并且代码里出现 close() 调用；
+      - 该 QTimer 在创建后调用了 start(...)（成为周期定时器）；
+      - 其句柄既不是类成员，也没有放进任何容器。
+    此时除回调自身外无人能停止它，而窗口已经隐藏 —— 定时器会永久空转。
+
+    为什么把范围收窄到 QWidget：像 FingerprintManager 这样随程序存活的
+    QObject，其“等待手指”轮询本来就是设计上的常驻行为（识别流程结束时
+    才 stop），并非缺陷。只有「承载它的界面可能先消失」时才构成问题。
+    单次触发（singleShot / setSingleShot(true)）也会自己结束，不在范围内。
+    """
+    for path in find_files(src_root, {".cpp"}):
+        text = strip_comments_and_strings(read(path))
+        rel = os.path.relpath(path, root)
+        if "new QTimer" not in text:
+            continue
+
+        header = path[:-4] + ".h"
+        if not os.path.isfile(header):
+            continue
+        htext = strip_comments_and_strings(read(header))
+
+        # 只处理 QWidget 子类，且该文件里确实会 close()（说明能被隐藏而非销毁）
+        if not re.search(r'class\s+\w+\s*:\s*public\s+QWidget\b', htext):
+            continue
+        if not re.search(r'\bclose\s*\(\s*\)', text):
+            continue
+
+        # 头文件里的成员变量名
+        members = set(re.findall(r'\b(m_\w+)\s*(?:=|;)', htext))
+
+        for m in re.finditer(r'\bQTimer\s*\*\s*(\w+)\s*=\s*new\s+QTimer\b', text):
+            var = m.group(1)
+            # 只关心“使能了周期性启动”的定时器
+            if not re.search(re.escape(var) + r'\s*->\s*start\s*\(', text):
+                continue
+            if var in members:
+                continue  # 有成员句柄，外部可停
+            # 句柄是否被放进了某个容器（QList/QVector/append/<<）
+            if re.search(r'\b\w+\s*(?:\.append|<<)\s*\(\s*' + re.escape(var), text):
+                continue
+            line = text.count("\n", 0, m.start()) + 1
+            fail("[unguarded-timer] {}:{} 窗口类里的局部定时器 '{}' 被 start() 成"
+                 "周期定时器却没有任何成员/容器保存句柄；除回调自身外无人能停止它。"
+                 "该类会 close()（窗口被隐藏但对象仍存活，未设 WA_DeleteOnClose 时"
+                 "尤其如此），定时器会在 GUI 线程上永久空转。"
+                 "请改为成员变量并提供停止入口。"
+                 .format(rel, line, var))
+
+
+def check_deleted_on_close_members(root, src_root):
+    """
+    WA_DeleteOnClose 窗口不得用裸指针成员跟踪。
+
+    背景（真实缺陷，本轮由重构引入并修复）：on_btnpsswd_clicked() 创建
+    Form_passwd 并设 Qt::WA_DeleteOnClose，然后把裸指针存进成员
+    m_passwdForm。该窗口在用户点“确定”或直接关闭时会被 Qt 自动销毁，
+    m_passwdForm 立刻成为悬垂指针；而 PasswordManager::passwordChecked
+    的回调里还会 `if (m_passwdForm) m_passwdForm->close();` ——
+    对已释放对象调用成员函数，use-after-free。
+
+    这类缺陷静态上很好识别：凡是在某处 `setAttribute(Qt::WA_DeleteOnClose)`
+    的对象，若其句柄被赋给「裸指针类型的成员」，就需要改造成 QPointer
+    （对象销毁后自动变空）。
+
+    注意 baseline 里这段恰好不触发：原代码写的是
+        Form_passwd* passwdForm = new Form_passwd(this);
+    声明了同名【局部变量】遮蔽成员，成员永远为 nullptr，所以不会悬垂，
+    但代价是“密码正确后窗口不会关闭”。重构把局部改为成员时修掉了那个
+    功能缺陷，却引入了悬垂——这正是本检查要防住的回归。
+    """
+    for path in find_files(src_root, {".cpp"}):
+        text = strip_comments_and_strings(read(path))
+        rel = os.path.relpath(path, root)
+        if "WA_DeleteOnClose" not in text:
+            continue
+
+        # 收集「被设置了 WA_DeleteOnClose 的变量名」
+        marked = set()
+        for m in re.finditer(r'(\w+)\s*->\s*setAttribute\s*\(\s*'
+                             r'(?:Qt::)?WA_DeleteOnClose', text):
+            marked.add(m.group(1))
+        # 形如 setAttribute(Qt::WA_DeleteOnClose) 的隐式 this 用法不涉及成员名
+
+        if not marked:
+            continue
+
+        # 在头文件里找裸指针类型的成员声明
+        header = path[:-4] + ".h"
+        if not os.path.isfile(header):
+            continue
+        htext = strip_comments_and_strings(read(header))
+        # 形如:  Form_passwd* m_passwdForm = nullptr;
+        #        Form_passwd *m_passwdForm;
+        raw_members = {}
+        for m in re.finditer(r'^\s*(?:[\w:]+)\s*\*\s*(m_\w+)\s*(?:=[^;]*)?;',
+                             htext, re.M):
+            raw_members[m.group(1)] = m.group(0).strip()
+
+        for var in marked:
+            # 该变量是否被赋给了某个裸指针成员
+            # 形如  m_xxx = var;   或   m_xxx = new ...（new 形式也查）
+            for mm in re.finditer(r'\b(m_\w+)\s*=\s*' + re.escape(var) + r'\s*;',
+                                  text):
+                member = mm.group(1)
+                if member in raw_members:
+                    line = text.count("\n", 0, mm.start()) + 1
+                    fail("[dtor-close] {}:{} 把设了 WA_DeleteOnClose 的 '{}' 存入"
+                         "裸指针成员 '{}'（{}）；该窗口关闭时会被 Qt 自动销毁，"
+                         "成员随即悬垂。请改用 QPointer<...>。"
+                         .format(rel, line, var, member,
+                                 raw_members[member]))
+
+
 def main():
     if len(sys.argv) < 2:
         print("用法: python verify.py <项目根目录>")
@@ -403,6 +533,8 @@ def main():
     check_qt5_portability(root, src_root)
     check_forward_declarations(root, src_root)
     check_media_gated_by_answer(root, src_root)
+    check_deleted_on_close_members(root, src_root)
+    check_unqueued_poll_timers(root, src_root)
     check_json_configs(root)
 
     print(f"校验目录: {root}")
