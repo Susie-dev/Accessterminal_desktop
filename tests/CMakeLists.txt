@@ -31,7 +31,7 @@ set(CMAKE_AUTOMOC ON)
 # 独立构建时必须自己启用测试注册，否则 add_test() 不生效。
 enable_testing()
 
-find_package(Qt5 5.12 REQUIRED COMPONENTS Core Test Network)
+find_package(Qt5 5.12 REQUIRED COMPONENTS Core Test Network Gui)
 
 # 作为子目录被主工程引入时 CMAKE_SOURCE_DIR 指向主工程根，src 在其下；
 # 独立构建时 CMAKE_SOURCE_DIR 就是 tests/，src 在上一级。两种都要能工作。
@@ -110,3 +110,44 @@ target_link_libraries(desktop_test_signaling_server PRIVATE
 )
 
 add_test(NAME desktop_signaling_server COMMAND desktop_test_signaling_server)
+
+# ---------------------------------------------------------------------------
+# MonitorClient：室内机 UDP 50000 远程监看客户端
+#
+# UDP 50000 是**协议硬约束**的一员，而且语义与另外三条都不同：
+#   - 请求文本是**裸的、不带 '\n'**（与 TCP 8887 信令不同！）；
+#   - 门口机**只有收到 getframe 之后**才开始按 50ms 定时器推帧；
+#   - 收到 stop 就停推；每包一帧完整 JPEG，无重组、无重传。
+#
+# 门口机侧（CameraUdpServer）已有 t113_test_camera_preview 覆盖，
+# 但室内机侧这一半从来没有测过 —— 两条半必须配对，否则一边改了字节，
+# 另一边的测试还是绿的，而互操作已经断了。
+#
+# 用**真实 QUdpSocket** + 真实事件循环，不调私有槽：
+# 假门口机绑在 127.0.0.2:50000，MonitorClient 绑 Any:50000 并把 deviceIp
+# 设为 127.0.0.2。于是"发出的请求"与"收到的帧"归属都是确定的。
+#
+# 为什么必须显式链 Qt5::Gui：onReadyRead() 用的是 **QPixmap**
+# （QPixmap::loadFromData），不是 QImage。QTEST_MAIN 在链了 Qt5::Gui 时
+# 会生成 QGuiApplication，从而让 QPixmap 在无显示的开发机上也能工作
+# （实测平台插件 = windows，loadFromData 成功）。
+#
+# 不需要测试替身，直接链接真实的 monitor_client.cpp。
+# ---------------------------------------------------------------------------
+add_executable(desktop_test_monitor_client
+    test_monitor_client.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/core/net/monitor_client.cpp
+)
+
+target_include_directories(desktop_test_monitor_client PRIVATE
+    ${ACCESSTERMINAL_SRC_ROOT}
+)
+
+target_link_libraries(desktop_test_monitor_client PRIVATE
+    Qt5::Core
+    Qt5::Test
+    Qt5::Network
+    Qt5::Gui
+)
+
+add_test(NAME desktop_monitor_client COMMAND desktop_test_monitor_client)

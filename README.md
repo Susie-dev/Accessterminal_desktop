@@ -97,9 +97,10 @@ cmake --build /tmp/desktop-tests
 ctest --test-dir /tmp/desktop-tests --output-on-failure
 ```
 
-当前 3 个目标：`desktop_protocol`（协议编解码）、`desktop_app_config`
+当前 4 个目标：`desktop_protocol`（协议编解码）、`desktop_app_config`
 （配置与灯控指令解析）、`desktop_signaling_server`（TCP 8887 信令服务端，
-真实 socket 端到端）。
+真实 socket 端到端）、`desktop_monitor_client`（**UDP 50000 远程预览客户端**，
+真实 socket + 环回别名假门口机，31 个用例）。
 
 > `tests/CMakeLists.txt` 此前缺 `cmake_minimum_required`/`project()`，独立构建
 > 会直接配置失败；补上之后又会因为缺 `enable_testing()` 而"构建成功、
@@ -301,7 +302,7 @@ bind、`newConnection`、`readyRead` 派发、`disconnected` 清理一并被验�
 
 ## 关键约定（由自动化检查强制）
 
-以下四十七条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+以下五十二条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
 `tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
 
 ### 1. 音视频通道只在接听后建立
@@ -821,8 +822,8 @@ a.write("l\n");            // 只有补上 A 自己的后半，才应出现 Call
 补上 gcov 度量后，第一个数字是 **93.6%**。把从未被链接的产线文件折进分母后，
 真实值是 **16.2%**。
 
-原因在**分母**：93.6% 只统计被链接进 3 个测试目标的文件。另有 **16 个产线源
-文件（约 1261 行）从未被任何测试目标链接**：
+原因在**分母**：93.6% 只统计被链接进测试目标的文件。另有 **14 个产线源
+文件（约 1136 行）从未被任何测试目标链接**：
 
 | 从未被任何测试链接的产线文件 | 说明 |
 | --- | --- |
@@ -830,20 +831,24 @@ a.write("l\n");            // 只有补上 A 自己的后半，才应出现 Call
 | `src/core/media/call_session.cpp` | 通话会话 |
 | `src/core/weather/weather_service.cpp` | 天气服务 |
 | `src/hal/serial_light.cpp` | 串口灯控 |
-| `src/core/net/monitor_client.cpp` | **此前已知零覆盖**，本轮再次确认 |
 | `src/ui/form_phonecall.cpp` | 通话界面 |
 | `src/ui/slidehintwidget.cpp` | 滑动提示控件 |
 | `src/main.cpp` 及其余头文件 | — |
 
+> `src/core/net/monitor_client.cpp` **第 31 轮已移出本表**：新增
+> `desktop_monitor_client` 目标后，它 318 行里覆盖 298 行，
+> 且"可达未测"降为 **0**（余下 3 行是 `qDebug` 文案等不可达点）。
+
 `tools/run_coverage.sh` 一键产出：
 
 ```
-已测文件 264 行（覆盖 247）+ 未测文件约 1261 行 = 分母 1525
-近似总覆盖率 = 16.2%   （上表那个 93.6% 仅描述已测文件）
+已测文件 318 行（覆盖 298）+ 未测文件约 1136 行 = 分母 1454
+近似总覆盖率 = 20.5%   （上表那个 93.7% 仅描述已测文件）
 ```
 
 被测到的文件覆盖度本身不错：`src/core/net/signaling_server.cpp` 76/76 = 100%，
-`src/config/app_config.cpp` 100%，合计 264 行中 247 行（93.6%）。
+`src/config/app_config.cpp` 100%，`src/core/net/monitor_client.cpp` 可达部分
+100%，合计 318 行中 298 行（93.7%）。
 
 **数字正确、口径错误，比没有数字更危险** —— 它会让人停止寻找缺口。
 
@@ -1227,6 +1232,94 @@ except Exception:
 CMake 则先把目标块切出来（`add_executable(...)` / `target_link_options(...)`
 的括号内容），在块内查名字，而不是整文件查子串。
 
+### 48. 给 `MonitorClient` 补测试：UDP 50000 的行为契约
+
+第 31 轮给 `src/core/net/monitor_client.cpp` 补了 31 个用例
+（`tests/test_monitor_client.cpp`）。它是室内机侧 **UDP 50000 远程预览**
+协议的实现者 —— 产线在跑（`widget.cpp:107/326`），此前**零**单元覆盖。
+
+**协议（逐字节，不可改）**：PC 向门口机发**裸文本**数据报
+`"getframe"` / `"stop"`，**不带换行**；门口机只在收到 `getframe` 后才推帧。
+请求源自本端 **50000** 端口，因此要 `bind(Any, kPreviewPort,
+ShareAddress | ReuseAddressHint)` —— 绑定失败要报 `errorOccurred` 并返回
+`false`，不能"静默继续"（那样会发不出去也收不到，界面却显示已开启）。
+
+> **陷阱**：`"stop"` 是 TCP 8887 上 `"stopsend"` 的**前缀**。UDP 侧必须是
+> `stop`，写成 `stopsend` 门口机会当成完全不同的信令，预览**永远不会停**。
+> 已由静态规则与故障注入双向钉住。
+
+### 49. 两个 socket 绑同一端口时，**谁收到**不可预测；用环回别名消歧
+
+写测试时要在本机模拟"门口机"，最自然的做法是让假门口机也绑
+`Any:50000`。第 31 轮实测（探针 `result3.txt`）：**两个都带
+`ShareAddress` 的 socket 绑同一地址时，数据报只投给其中一个，且不可预测**
+—— 测试会随机失败。
+
+改用**环回别名**即可确定性消歧：假门口机绑 `127.0.0.2:50000`，
+被测的 `MonitorClient` 绑 `Any:50000`。实测**两个方向都稳定**，
+且与绑定顺序无关（重复 5/5 次一致）：每一个 `getframe`/`stop` 都落到
+假门口机，每一帧都落到 `MonitorClient`。
+
+反向也测了（探针 `result4.txt`）：先用**独占**方式（不带 `ShareAddress`）
+绑上 `Any:50000`，`MonitorClient` 的 `ShareAddress | ReuseAddressHint`
+绑定会**确定性地失败**并报 "The address is protected" —— 于是错误分支
+可以被真实地触发，而不是靠 mock。
+
+```cpp
+// 假门口机（环回别名，不与被测争抢同一地址）
+m_socket.bind(QHostAddress("127.0.0.2"), 50000,
+              QUdpSocket::ShareAddress | QUdpSocket::ReuseAddressHint);
+```
+
+注意 `bind(QHostAddress::Any, 0)` 在 Qt5 里是**二义**的
+（`bind(const QHostAddress&, quint16, BindMode)` vs `bind(quint16, BindMode)`）；
+必须写成 `bind(QHostAddress(QHostAddress::Any), quint16(0))`。
+
+### 50. `QPixmap` 需要 `Qt5::Gui`/`QGuiApplication`，且它**已被 Qt 注册**
+
+`MonitorClient` 的 `frameReceived` 信号带的是 `QPixmap`（不是 `QImage`），
+因此这是本仓库**第一个**必须链 `Qt5::Gui` 的测试目标；`QTEST_MAIN` 会据此
+生成 `QGuiApplication`。实测 `QGuiApplication` 在无显示的 Windows 上可以
+正常工作（平台插件 `windows`）。
+
+同时实测（探针 `result10b.txt`）：`QPixmap` **已经被 Qt 自己注册**为元类型
+（`QMetaType::type("QPixmap") == 65`），**不需要** `qRegisterMetaType`。
+这条实测同时修掉了一个真实误报：`check_signalspy_types_are_registered` 的
+内建类型集合漏了整片 GUI 类型，会把用 `QSignalSpy` 断言 `QPixmap` 的测试
+误报成"缺注册"。实测**未**注册的（`QPainterPath`、`QHostAddress`、
+`QMimeType`、`QTcpSocket*` 均为 0）**故意不列入**，它们确实需要显式注册。
+
+### 51. 有些契约**行为测试根本抓不到** —— 交给静态规则，并**实测证明**抓不到
+
+给 `MonitorClient` 做故障注入时，有三处退化**测了也抓不到**。与其写一条
+看起来守着、其实守不住的断言（那比没有断言更糟，因为它会让人误以为这块
+已被覆盖），不如**如实记录边界**，并改由静态规则守：
+
+| 退化 | 为什么行为测试抓不到 | 谁来守 |
+|---|---|---|
+| `"JPG"` → `"JPEG"` | 实测（`result5.txt`）`QPixmap::loadFromData` 对两者**都能解码**同一份 JPEG（都 `isNull=0`、64×48） | `check_monitor_client_contract_is_pinned` 直接钉字面量 |
+| `while` → 只读一个 | 实测（`result8.txt`）Qt 在数据报仍有剩余时会**再次**发 `readyRead`，两种写法最终都把帧送完：连发 50 个时 while 读 50 / 触发 **1** 次，if 版读 50 / 触发 **50** 次 | 同上（钉 `while`；20fps 下回调差是真开销） |
+| 删 `if (bytesRead < 0)` 等 | 实测（`result7.txt`）按 `pendingDatagramSize()` 分配缓冲区时，`readDatagram` 返回值**永远等于**该大小（0/1/4/100/678/1400/65507 全部相等），分支**不可达** | 同上（纵深防御，不可删） |
+
+并把"抓不到"变成**可执行的断言**：`UNDETECTABLE` 列表里的退化被要求
+**必须抓不到**；一旦将来某次改动让它变得可观测，夹具会报错并提示
+**把它提升为真变异**，而不是继续留在免责清单里。
+
+> 另外注意：`while` **不能**简单改成 `if` 来制造变异 —— 循环体里有
+> `continue`，会直接编译失败。用只跑一次的 `for` 才构造得出合法变异。
+
+### 52. 静态规则**必须限定在函数体内**，否则会被别处的同名串顶包
+
+`check_monitor_client_contract_is_pinned` 第一版检查"`widget.cpp` 里是否
+出现 `!m_cameraActive`"，故障注入当场抓到：把
+`Widget::onVideoFrameReady` 里那道"非活动态不收帧"的门删掉之后，规则
+**仍然通过** —— 因为 `on_btngetframe_clicked` 里还有一处
+`if (!m_cameraActive)`（第 328 行）替它顶了包。
+
+修法：`_brace_matched_body()` 先剥注释与字符串，再按大括号配对**取出函数体**
+只在体内查。这就是"守卫条件不得引用被守卫内容里也出现的字符串"那条规矩的
+一个具体形态：**整文件子串检查是最容易变成恒真的一类规则。**
+
 ## 开发约定
 
 - **标准**：C++11
@@ -1271,6 +1364,8 @@ python3 tools/verify_gated_resume.py .
 python3 tools/verify_fp_ack_tag.py .
 python3 tools/verify_signalspy_metatype.py .
 python3 tools/verify_dead_slot.py .
+python3 tools/verify_monitor_client_rule.py
+python3 tools/verify_monitor_client_test.py
 bash tools/run_coverage.sh
 
 # 3. 跨仓库协议一致性

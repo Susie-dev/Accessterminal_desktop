@@ -49,6 +49,43 @@ def find_files(root, exts):
     return out
 
 
+def _brace_matched_body(text, marker):
+    r"""
+    取出 `marker` 之后第一对**配对**大括号之间的函数体。
+
+    为什么需要它（第 31 轮故障注入实测的教训）
+    ------------------------------------------
+    静态规则若写成"整个文件里出现过某个字符串就算通过"，就会被同文件里
+    **别处**的相同字符串顶包，成为恒真检查。实测：
+    `check_monitor_client_contract_is_pinned` 第一版检查"widget.cpp 里
+    是否出现 !m_cameraActive"，把 Widget::onVideoFrameReady 里那道门删掉
+    之后规则**仍然通过** —— 因为 on_btngetframe_clicked 里还有一处
+    `if (!m_cameraActive)`（第 328 行）恰好在文件里，替它顶了包。
+    这正是"守卫条件不得引用被守卫内容里也出现的字符串"那条规矩。
+
+    实现要点：先剥掉注释与字符串（否则括号会数错），再按大括号配对。
+    找不到 marker 或括号不配对时返回 None（调用方应当报"规则自身需修复"，
+    而不是静默放过 —— 静默放过就是又一次恒真检查）。
+    """
+    code = strip_comments_and_strings(text)
+    i = code.find(marker)
+    if i < 0:
+        return None
+    j = code.find("{", i)
+    if j < 0:
+        return None
+    depth = 0
+    for k in range(j, len(code)):
+        c = code[k]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return code[j + 1:k]
+    return None
+
+
 def check_includes(root, src_root):
     """
     本地 #include 必须可解析：相对当前文件目录，或相对 src/ 根。
@@ -1951,6 +1988,26 @@ def check_signalspy_types_are_registered(root, src_root):
         return
 
     # Qt 内建类型不必注册（已在 Qt 元类型系统里）。
+    #
+    # 这个集合**不是猜的**：第 31 轮用探针实测了
+    # `QMetaType::type("<名字>")`（结果见 tools/verify_signalspy_metatype.py
+    # 与 README 第 31 轮小节）。实测发现原集合漏掉了**整片 GUI 类型** ——
+    # QPixmap 实测返回 65（已注册），而它不在原集合里，于是任何用
+    # QSignalSpy 断言 QPixmap 的测试都会被误报为"缺注册"。
+    # 实测**已注册**的 GUI/几何类型补进来了；实测**未注册**的
+    # （QPainterPath、QHostAddress、QMimeType、QTcpSocket*）**故意不列**，
+    # 它们确实需要显式注册。
+    #
+    # 实测数据（Qt 5.15.19 / MinGW）：
+    #   QPixmap 65  QImage 70  QBitmap 73  QColor 67  QFont 64  QBrush 66
+    #   QPen 76  QIcon 69  QCursor 74  QPalette 68  QRegion 72
+    #   QTransform 80  QMatrix 79  QPolygon 71  QPolygonF 86
+    #   QKeySequence 75  QQuaternion 85  QVector2D 82  QVector3D 83
+    #   QVector4D 84  QVariant 41  QStringList 11  QRegExp 27
+    #   QRegularExpression 44  QSizeF 22  QUrl 17  QObject* 39
+    #   ---- 以下实测为 0（未注册），故不列入 ----
+    #   QPainterPath 0  QHostAddress 0  QMimeType 0  QTcpSocket* 0
+    #   QAbstractSocket::SocketState 0  QTimer* 0
     builtin = {
         "int", "bool", "double", "float", "char", "short", "long",
         "uint", "ushort", "ulong", "qint8", "qint16", "qint32", "qint64",
@@ -1960,6 +2017,11 @@ def check_signalspy_types_are_registered(root, src_root):
         "QChar", "QLocale", "QRegExp", "QRegularExpression", "QStringList",
         "QVariantList", "QVariantMap", "QVariantHash", "QBitArray",
         "unsigned int", "unsigned char", "unsigned short", "unsigned long",
+        # 实测已注册的 GUI 类型（第 31 轮补充，见上表）
+        "QPixmap", "QImage", "QBitmap", "QColor", "QFont", "QBrush",
+        "QPen", "QIcon", "QCursor", "QPalette", "QRegion", "QTransform",
+        "QMatrix", "QPolygon", "QPolygonF", "QKeySequence", "QQuaternion",
+        "QVector2D", "QVector3D", "QVector4D", "QObject*",
     }
 
     for path in find_files(tests_root, {".cpp"}):
@@ -2878,6 +2940,134 @@ def check_fault_harnesses_classify_crashes_correctly(root, src_root):
              "crashed = returncode != 0 and not failed。")
 
 
+def check_monitor_client_contract_is_pinned(root, src_root):
+    r"""
+    远程监看（UDP 50000）里有几处**行为测试根本抓不到**的契约，必须靠静态规则守。
+
+    背景：第 31 轮给 MonitorClient 补了 31 个用例（真实 QUdpSocket + 事件循环），
+    但故障注入过程中实测出三处**没有判别力**的地方。诚实记录如下，
+    并把它们交给本规则，而不是留在测试里假装守着（假断言比没有断言更糟，
+    因为它让人以为这块已经被守住了）：
+
+      1. `pix.loadFromData(datagram, "JPG")` 里的 **"JPG"** 字面量。
+         实测（探针 result5.txt）：`QPixmap::loadFromData` 对 `"JPG"` 与
+         `"JPEG"` **都能解码**同一份真实 JPEG（两者都 isNull=0、64x48）。
+         因此把 "JPG" 改成 "JPEG" **没有任何行为差异**，任何断言都抓不到。
+         但它是基线继承来的写法（基线 desktop/smartserver/widget.cpp:369
+         就是 `pix.loadFromData(datagram, "JPG")`），且**与门口机侧的
+         `"JPEG"` 不对称** —— 那是 baseline 有意/无意的现状，不能被
+         "顺手统一"。这里直接钉住两侧各自的字面量。
+
+      2. `while (m_socket->hasPendingDatagrams())` 里的 **while**。
+         实测（探针 result8.txt）：Qt 在数据报仍有剩余时会**再次**发出
+         readyRead，所以 while 版与"只读一个"版最终都把帧送完：
+             连发 50 个：while 读到 50、readyRead 触发 1 次
+                         if    读到 50、readyRead 触发 50 次
+         "帧有没有全到"对 while/if 没有判别力。while 的存在只能查源码文本。
+
+      3. `if (bytesRead < 0)` / `if (bytesRead < datagram.size())` 两处防御。
+         实测（探针 result7.txt）：缓冲区按 pendingDatagramSize() 分配时，
+         readDatagram 的返回值**永远等于**该大小（0/1/4/100/678/1400/65507
+         全部相等），这两个分支在真实 socket 路径上**不可达**。
+         它们是纵深防御，删掉无行为差别，只能靠静态规则守着。
+
+    同时钉住**写侧的字节与端口**：这两个测试其实覆盖得住，但静态规则顺手
+    再确认一次，成本极低，且能在测试被整体删除时仍然报错。
+    """
+    mc = os.path.join(src_root, "core", "net", "monitor_client.cpp")
+    if not os.path.exists(mc):
+        return  # 本仓库没有该模块（例如门口机侧），规则安全通过
+    text = io.open(mc, encoding="utf-8", errors="replace").read()
+
+    def has(needle, why):
+        if needle not in text:
+            fail("[monitor-client] monitor_client.cpp 里找不到 %r；%s"
+                 % (needle, why))
+
+    # 1) 解码提示字面量。**故意不要求它等于 "JPEG"** —— 基线就是 "JPG"。
+    if 'loadFromData(datagram, "JPG")' not in text:
+        fail('[monitor-client] monitor_client.cpp 里应当用 '
+             '`loadFromData(datagram, "JPG")` —— 这是基线继承来的写法'
+             '（基线 widget.cpp:369 同为 "JPG"，与门口机侧的 "JPEG" 不对称）。'
+             '实测 QPixmap 对两者都能解码，所以行为测试抓不到这个改动，'
+             '只能在这里钉住。不要"顺手统一"成 "JPEG"。')
+
+    # 2) while 循环（一次 readyRead 尽量排空；即使行为上等价，也是**效率**契约：
+    #    每 50ms 一帧的推流下，if 版会让事件循环多出几十倍的回调）。
+    if "while (m_socket->hasPendingDatagrams())" not in text:
+        fail("[monitor-client] monitor_client.cpp 的 onReadyRead 应当用 "
+             "`while (m_socket->hasPendingDatagrams())` 排空挂起数据报。"
+             "实测 Qt 会为重发 readyRead，所以行为测试抓不到 while->if 的"
+             "退化；但 if 版会让一次突发产生几十倍的回调（实测连发 50 个："
+             "while 触发 1 次、if 触发 50 次），在 20fps 推流下是真实开销。")
+
+    # 3) readDatagram 返回值防御（纵深防御，不可达但不可删）。
+    if "const qint64 bytesRead = m_socket->readDatagram(" not in text:
+        fail("[monitor-client] monitor_client.cpp 应当保留 readDatagram 的"
+             "返回值（const qint64 bytesRead = ...）。"
+             "实测该分支当前不可达，因此删除它没有行为差异 —— 正因如此"
+             "行为测试抓不到，只能靠这条规则守着。")
+    if "if (bytesRead < 0)" not in text:
+        fail("[monitor-client] monitor_client.cpp 缺少 `if (bytesRead < 0)` "
+             "的读取失败判断（纵深防御，见函数文档）。")
+    if "if (bytesRead < datagram.size())" not in text:
+        fail("[monitor-client] monitor_client.cpp 缺少 "
+             "`if (bytesRead < datagram.size())` 的缩容判断："
+             "QByteArray::resize() 不清零新分配的内存，实际读到的字节数若"
+             "少于挂起大小，尾部就是未初始化字节，会被当成 JPEG 数据。")
+
+    # 4) 写侧：文本身份 + 端口。这是跨仓库契约，必须逐字节一致。
+    if 'QByteArrayLiteral("getframe")' not in text:
+        fail('[monitor-client] 请求文本必须是 QByteArrayLiteral("getframe")，'
+             '与门口机 CameraUdpServer 的 exact match 一致。')
+    if 'QByteArrayLiteral("stop")' not in text:
+        fail('[monitor-client] 停止文本必须是 QByteArrayLiteral("stop")，'
+             "不能写成 stopsend（那是 TCP 8887 的另一个信令，前缀相同）。")
+    # 不允许在 UDP 请求上出现换行 —— 这是与 TCP 8887 最容易被混淆的一点。
+    for lit in ('"getframe\\n"', '"stop\\n"'):
+        if lit in text:
+            fail("[monitor-client] UDP 50000 的请求文本**不能带换行符**"
+                 "（发现 %s）。门口机侧按裸文本 exact match，"
+                 "多一个 '\\n' 会让它静默不响应。" % lit)
+    if "protocol::kPreviewPort" not in text:
+        fail("[monitor-client] monitor_client.cpp 应当用 protocol::kPreviewPort "
+             "而不是硬编码端口号。")
+
+    # 5) 生产接线：Widget 里那道"非活动态不收帧"的门必须还在。
+    #    它从 MonitorClient 搬到了 Widget::onVideoFrameReady（基线在
+    #    onUdpDataReceived 里是 `if (!pix.isNull() && camActive)`）。
+    #    行为测试故意不断言它（那会与实现位置绑定），所以在这里守着。
+    #
+    #    **必须把检查限定在函数体内**。第一版写成"整个 widget.cpp 里出现
+    #    !m_cameraActive 即可"，结果故障注入把它抓包：把 onVideoFrameReady
+    #    的门删掉之后规则**仍然通过** —— 因为 on_btngetframe_clicked 里
+    #    还有一处 `!m_cameraActive`（第 328 行）顶包。
+    #    这正是"守卫条件不得引用被守卫内容里也出现的字符串"那条规矩，
+    #    于是改成按大括号配对取出函数体再查。
+    widget = os.path.join(src_root, "ui", "widget.cpp")
+    if os.path.exists(widget):
+        wtext = io.open(widget, encoding="utf-8", errors="replace").read()
+
+        if "m_monitor->toggle(" not in wtext:
+            fail("[monitor-client] Widget 应当通过 m_monitor->toggle(...) "
+                 "切换监看（基线是内联的 writeDatagram），"
+                 "不要退回内联实现。")
+
+        if "onVideoFrameReady" in wtext:
+            body = _brace_matched_body(wtext, "void Widget::onVideoFrameReady")
+            if body is None:
+                fail("[monitor-client] 无法在 widget.cpp 里定位 "
+                     "Widget::onVideoFrameReady 的函数体（规则自身需要修复）。")
+            elif "!m_cameraActive" not in body:
+                fail("[monitor-client] Widget::onVideoFrameReady 的函数体里"
+                     "应当保留『非活动态不收帧』的门（基线是 "
+                     "`if (!pix.isNull() && camActive)`）。"
+                     "去掉它会让『已停止监看』之后到达的迟到帧仍然显示。"
+                     "注意：本检查**限定在函数体内** —— 只在整个文件里搜 "
+                     "!m_cameraActive 是无效的，on_btngetframe_clicked 里"
+                     "还有一处同样的判断会顶包（第 31 轮故障注入实测）。")
+
+
 def check_cross_repo_test_targets_are_unique(root, extra_root):
     """
     两个仓库的测试目标名必须互不冲突，否则**超级工程无法配置**。
@@ -2979,6 +3169,7 @@ def main():
     check_gpio_failure_paths_are_testable(root, src_root)
     check_face_gate_hazard_is_documented(root, src_root)
     check_fault_harnesses_classify_crashes_correctly(root, src_root)
+    check_monitor_client_contract_is_pinned(root, src_root)
     check_fake_fingerprint_builds_same_bytes(root, src_root)
     check_fingerprint_checksum_logic_is_not_duplicated(root, src_root)
     check_gated_wire_paths_have_resume_test(root, src_root)

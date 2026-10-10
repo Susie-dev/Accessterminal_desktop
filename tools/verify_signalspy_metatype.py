@@ -66,6 +66,39 @@ private slots:
 """
 
 
+# 第 31 轮实测补充：QPixmap 实测为 QMetaType::type("QPixmap") == 65，
+# **Qt 自己已经注册**，不需要 qRegisterMetaType。原 builtin 集合漏了整片
+# GUI 类型，会把用 QSignalSpy 断言 QPixmap 的测试误报成"缺注册"
+# （本规则第 31 轮就是这么误报 tests/test_monitor_client.cpp 的）。
+PIXMAP_SRC = """#include <QSignalSpy>
+#include <QPixmap>
+class P : public QObject {
+    Q_OBJECT
+private slots:
+    void t() {
+        QSignalSpy spy(this, 0);
+        spy.at(0).at(0).value<QPixmap>();
+    }
+};
+"""
+
+# 反面：QHostAddress / QTcpSocket* / QPainterPath 实测**未注册**（均为 0），
+# 用了就必须显式注册 —— 补 builtin 时不能把这一片也一起放过。
+UNREGISTERED_SRC = """#include <QSignalSpy>
+#include <QHostAddress>
+#include <QPainterPath>
+class P : public QObject {
+    Q_OBJECT
+private slots:
+    void t() {
+        QSignalSpy spy(this, 0);
+        spy.at(0).at(0).value<QHostAddress>();
+        spy.at(0).at(1).value<QPainterPath>();
+    }
+};
+"""
+
+
 def load():
     spec = importlib.util.spec_from_file_location("v", VERIFY)
     m = importlib.util.module_from_spec(spec)
@@ -118,6 +151,10 @@ print("== check_signalspy_types_are_registered 故障注入自检 ==")
 run_case("两种类型都注册 -> 无告警(真阴性)", GOOD_SRC, 0)
 run_case("两种类型都漏 -> 2 项(真阳性)", BAD_SRC, 2)
 run_case("只漏 QTcpSocket* -> 1 项(半缺失也能抓)", HALF_SRC, 1)
+# 第 31 轮实测补充
+run_case("QPixmap 已由 Qt 注册 -> 0 项(不误报)", PIXMAP_SRC, 0)
+run_case("实测未注册的 QHostAddress/QPainterPath -> 2 项(补 builtin 没放过)",
+         UNREGISTERED_SRC, 2)
 
 # 真实仓库实测：本仓库若有 QSignalSpy 测试，必须全绿
 TOTAL += 1
