@@ -118,20 +118,15 @@ void SignalingServer::onClientReadyRead(QTcpSocket* client)
     const QByteArray data = client->readAll();
     qDebug() << "[信令] 收到数据来自" << client << ":" << data;
 
-    // TCP 是字节流：一次 readAll 可能含多条 '\n' 分隔的信令，
-    // 也可能只有半条。重构前用 data.trimmed() 整体比较，
-    // 粘包/半包时会漏判，这里按终止符切分。
-    const QList<QByteArray> lines = data.split(protocol::kSignalTerminator);
-    for (const QByteArray& line : lines) {
-        const QByteArray trimmed = line.trimmed();
-        if (trimmed.isEmpty()) {
-            continue;
-        }
-        const protocol::Signal sig = protocol::fromWire(trimmed);
-        if (sig == protocol::Signal::Unknown) {
-            qWarning() << "[信令] 收到未知信令，已忽略:" << trimmed;
-            continue;
-        }
+    // TCP 是字节流：一次 readAll 可能含多条 '\n' 分隔的信令，也可能
+    // 只有半条。交给 protocol::StreamDecoder 做跨包重组——它既修掉了
+    // 旧版“半包会被静默丢弃”的缺陷，又保留了旧版对无 '\n' 结尾信令
+    // （如历史遗留的 "recstop"）的宽容语义。
+    // 解码器按连接区分，见 QHash<QTcpSocket*, StreamDecoder> m_decoders。
+    // 注意：局部变量不能叫 signals —— Qt 把 signals 定义成了宏
+    // （#define signals public），用它会直接把类体语法打乱。
+    const QList<protocol::Signal> decoded = m_decoders[client].feed(data);
+    for (const protocol::Signal sig : decoded) {
         // 门口机不应发 accept/recstop/getframe/stop，收到也交由 UI 判定。
         emit signalReceived(sig, client);
     }
@@ -141,6 +136,9 @@ void SignalingServer::onClientDisconnected(QTcpSocket* client)
 {
     const QString peer = client ? client->peerAddress().toString() : QString();
     m_clients.remove(client);
+    // 该连接的解码器一并清理：QTcpSocket 指针在 deleteLater 之后会被
+    // 复用，留着陈旧的半包可能被下一个连接的字节“续上”。
+    m_decoders.remove(client);
     if (client) {
         client->deleteLater();
     }

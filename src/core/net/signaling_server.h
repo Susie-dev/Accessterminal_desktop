@@ -14,6 +14,7 @@
 #define ACCESSTERMINAL_CORE_NET_SIGNALING_SERVER_H
 
 #include <QObject>
+#include <QHash>
 #include <QSet>
 
 #include "core/net/protocol.h"
@@ -80,6 +81,11 @@ private:
 
     QTcpServer* m_server = nullptr;
     QSet<QTcpSocket*> m_clients;
+
+    /// 每个连接各自的字节流解码器。
+    /// 必须按连接区分：TCP 半包是**连接级**状态，若所有连接共用一个
+    /// 解码器，多个门口机交错到达的半包会互相拼接成错误信令。
+    QHash<QTcpSocket*, protocol::StreamDecoder> m_decoders;
 };
 
 } // namespace accessterminal

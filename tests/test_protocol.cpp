@@ -132,6 +132,131 @@ private slots:
         QVERIFY(protocol::fromWire(QByteArray("getframe")) == protocol::Signal::GetFrame);
         QVERIFY(protocol::fromWire(QByteArray("stop")) == protocol::Signal::Stop);
     }
+
+    // ========================================================================
+    // StreamDecoder：TCP 字节流重组
+    //
+    // 这些用例守护一个真实修复过的缺陷——旧实现用
+    // split('\n') 就地解析，半包会被当成无法识别的信令而静默丢弃。
+    // "unlock\n" 被 TCP 拆成 "unl" 与 "ock\n" 时，开锁指令就此丢失。
+    // ========================================================================
+
+    // 一次喂入多条完整信令（粘包）
+    void decoderHandlesMultipleFrames()
+    {
+        protocol::StreamDecoder dec;
+        const QList<protocol::Signal> got = dec.feed(QByteArray("call\nunlock\nstopsend\n"));
+        QCOMPARE(got.size(), 3);
+        QCOMPARE(got.at(0), protocol::Signal::Call);
+        QCOMPARE(got.at(1), protocol::Signal::Unlock);
+        QCOMPARE(got.at(2), protocol::Signal::StopSend);
+        QVERIFY(!dec.hasPartial());
+    }
+
+    // 半包：第一段不完整时不得产生信令，拼接后才还原
+    void decoderBuffersPartialFrame()
+    {
+        protocol::StreamDecoder dec;
+
+        QList<protocol::Signal> got = dec.feed(QByteArray("unl"));
+        QCOMPARE(got.size(), 0);          // 关键：半包不得被当成信令丢弃
+        QVERIFY(dec.hasPartial());
+
+        got = dec.feed(QByteArray("ock\n"));
+        QCOMPARE(got.size(), 1);
+        QCOMPARE(got.at(0), protocol::Signal::Unlock);
+        QVERIFY(!dec.hasPartial());
+    }
+
+    // 逐字节喂入也必须还原（最极端的拆包）
+    void decoderHandlesByteByByteDelivery()
+    {
+        protocol::StreamDecoder dec;
+        const QByteArray wire = protocol::frame(protocol::Signal::Unlock);
+        QList<protocol::Signal> all;
+        for (int i = 0; i < wire.size(); ++i) {
+            all += dec.feed(wire.mid(i, 1));
+        }
+        QCOMPARE(all.size(), 1);
+        QCOMPARE(all.at(0), protocol::Signal::Unlock);
+    }
+
+    // 兼容旧版：无 '\n' 结尾但本身已是完整信令时立即识别。
+    // 历史版本室内机发出的 "recstop" 就漏了 '\n'
+    // （见 baseline desktop/smartserver/widget.cpp:566）。
+    void decoderAcceptsLegacyUnterminatedSignal()
+    {
+        protocol::StreamDecoder dec;
+        const QList<protocol::Signal> got = dec.feed(QByteArray("recstop"));
+        QCOMPARE(got.size(), 1);
+        QCOMPARE(got.at(0), protocol::Signal::RecStop);
+    }
+
+    // 歧义消除："stop" 是 "stopsend" 的前缀。
+    // 若把 "stopsend\n" 拆成 "stop" + "send\n"，不能凭 "stop" 就判定为
+    // Stop——那会触发错误行为（停掉监看推流，而非通知对端停止发送）。
+    void decoderDoesNotMisreadPrefixAsShorterSignal()
+    {
+        protocol::StreamDecoder dec;
+
+        QList<protocol::Signal> got = dec.feed(QByteArray("stop"));
+        QCOMPARE(got.size(), 0);          // 必须等待，不能当成 Stop
+        QVERIFY(dec.hasPartial());
+
+        got = dec.feed(QByteArray("send\n"));
+        QCOMPARE(got.size(), 1);
+        QCOMPARE(got.at(0), protocol::Signal::StopSend);
+    }
+
+    // 无法识别的行应被忽略，且不影响后续信令的解析
+    void decoderIgnoresUnknownLines()
+    {
+        protocol::StreamDecoder dec;
+        const QList<protocol::Signal> got =
+            dec.feed(QByteArray("bogus\ncall\n\xff\xfe\nunlock\n"));
+        QCOMPARE(got.size(), 2);
+        QCOMPARE(got.at(0), protocol::Signal::Call);
+        QCOMPARE(got.at(1), protocol::Signal::Unlock);
+    }
+
+    // 空行与 '\r\n' 应被忽略
+    void decoderIgnoresBlankLines()
+    {
+        protocol::StreamDecoder dec;
+        const QList<protocol::Signal> got =
+            dec.feed(QByteArray("\n\ncall\r\n\nunlock\n"));
+        QCOMPARE(got.size(), 2);
+        QCOMPARE(got.at(0), protocol::Signal::Call);
+        QCOMPARE(got.at(1), protocol::Signal::Unlock);
+    }
+
+    // reset() 必须丢弃残留半包（重连后避免陈旧字节与新数据拼接）
+    void decoderResetDiscardsPartial()
+    {
+        protocol::StreamDecoder dec;
+        QCOMPARE(dec.feed(QByteArray("unl")).size(), 0);
+        QVERIFY(dec.hasPartial());
+
+        dec.reset();
+        QVERIFY(!dec.hasPartial());
+
+        // reset 后残留的 "unl" 不应再与 "ock\n" 拼成 unlock
+        QCOMPARE(dec.feed(QByteArray("ock\n")).size(), 0);
+    }
+
+    // 对端一直不发终止符时，缓冲不能无限增长
+    void decoderBoundsUnboundedBuffer()
+    {
+        protocol::StreamDecoder dec;
+        // 喂入远超上限的非信令内容
+        dec.feed(QByteArray(64 * 1024, 'x'));
+        // 缓冲被清空，且没有产生任何信令
+        QVERIFY(dec.bufferedBytes() <= 64 * 1024);
+        // 之后仍能正常解析新信令
+        const QList<protocol::Signal> got = dec.feed(QByteArray("unlock\n"));
+        QCOMPARE(got.size(), 1);
+        QCOMPARE(got.at(0), protocol::Signal::Unlock);
+    }
 };
 
 QTEST_MAIN(TestProtocol)
