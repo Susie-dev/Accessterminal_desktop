@@ -223,6 +223,11 @@ python3 tools/check_signatures.py .
 # 3. 跨仓库协议一致性
 python3 tools/check_protocol_sync.py
 
+# 3b. cppcheck 静态分析（不需要编译器、不需要装 Qt，可跑在任何机器上）
+#     覆盖数据流、越界、空指针解引用、初始化顺序等 verify.py 查不到的问题。
+#     退出码只受 warning/error 影响，style 类仅打印。
+bash tools/run_cppcheck.sh
+
 # 4. 真实编译（静态检查无法发现类型不匹配等问题，必须实际编译）
 bash tools/build_host.sh
 ```
@@ -230,6 +235,10 @@ bash tools/build_host.sh
 第 1~3 步是静态检查，速度快但覆盖有限；**第 4 步是必要的**——
 真实缺陷（如声明与定义返回类型不一致、模板无法接受 lambda、
 前置声明的类名拼错）只有编译器能发现。
+
+第 3b 步（cppcheck）介于两者之间：它不需要编译器和 Qt 就能做数据流分析，
+在没有工具链的机器上也能跑，是本工程唯一可用的“半编译级”检查手段。
+安装：`pacman -S mingw-w64-x86_64-cppcheck`（MSYS2）。
 
 ---
 
