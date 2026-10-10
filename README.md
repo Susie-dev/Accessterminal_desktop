@@ -218,7 +218,7 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 
 ## 关键约定（由自动化检查强制）
 
-以下二十条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+以下二十二条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
 `tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
 
 ### 1. 音视频通道只在接听后建立
@@ -581,7 +581,7 @@ ctest 用例名加仓库前缀（`desktop_` / `t113_`）后，超级工程 **5/5
 python3 tools/verify.py . ../Accessterminal_T113
 ```
 
-用 `.clang-format` 统一格式，但**格式不是正确性**——上述二十条请以
+用 `.clang-format` 统一格式，但**格式不是正确性**——上述二十二条请以
 `verify.py` 的结果为准。
 
 
@@ -649,6 +649,30 @@ python3 tools/verify.py . ../Accessterminal_T113
 "`if (!X) { X = true; ... start(); }` + `X = false; ... stop();`" 形式的
 布尔闸门对，并要求 `tests/` 里出现"恢复"语义的用例或标记。
 自检见 `tools/verify_gated_resume.py`（5/5 用例）。
+### 21. 加了解析路径的"外层守卫"后，必须断言它**独有的**可观测效果
+
+一个流程里同一条件常出现**两次**（入口守卫 + 回调内让路）。只断言"最终没有
+产生副作用"时，**两道守卫互为遮蔽**：去掉入口守卫，回调内的守卫仍会在一轮
+之内兜住，"没有副作用"照样成立 —— 入口守卫于是成了**未被验证**的代码。
+
+正确做法是找到入口守卫**独有的**那个可观测效果。`FingerprintManager::
+startIdentify()` 里它在建定时器**之前**就发出"请按下指纹"的提示信号；回调内
+的守卫在 500 ms 后才触发，**无法**补救这次提示。因此要断言"挂起时连提示都
+不发"，而不只是"不下发帧"。
+
+第 21 轮的对照实验正是这样发现两道守卫互相遮蔽的（首版 7 个对照项里有 5 个
+"测不出来"，全部源于只断言了不下发）。
+
+### 22. 夹具里的取值必须让断言**可能失败**
+
+`STORE_CHAR` 的 id 高字节断言用 `id = 0x0005` 时，其高字节本来就是 `0x00`，
+把源码里的 `id >> 8` 改成常量 `0x00` 测试**照样通过** —— 断言形式正确，
+但取值让它没有区分度。改用 `0x0105`（两个字节都非零）后立即暴露。
+
+规则：凡是"大端拆分"或"逐字节比较"类的断言，**取值必须让被拆分的各个字节
+互不相同且非零**，否则应视为断言无效。同理，夹具里的函数名/宏名要**恰好**
+匹配被测规则的匹配模式（本轮另有 `startTimer()` 不匹配 `\bstart\s*\(`
+的实例，只因仓库里恰好存在真实文件才没暴露）。
 ## 开发约定
 
 - **标准**：C++11
@@ -675,7 +699,8 @@ python3 tools/check_signatures.py .
 #     check_hex_parse_is_validated / check_load_state_reset /
 #     check_wire_format_constants_are_pinned /
 #     check_nonblock_pcm_handles_eagain /
-#     check_gated_wire_paths_have_resume_test / check_narrowing_cast_of_config
+#     check_gated_wire_paths_have_resume_test /
+#     check_fingerprint_ack_tag_is_validated / check_narrowing_cast_of_config
 #     做故障注入。静态规则写错会静默失效，必须证明它真能区分好坏代码。
 python3 tools/verify_config_sanity.py .
 python3 tools/verify_config_knobs.py .
@@ -689,6 +714,7 @@ python3 tools/verify_cross_target.py .
 python3 tools/verify_wire_format.py .
 python3 tools/verify_nonblock_pcm.py .
 python3 tools/verify_gated_resume.py .
+python3 tools/verify_fp_ack_tag.py .
 
 # 3. 跨仓库协议一致性
 python3 tools/check_protocol_sync.py

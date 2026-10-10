@@ -1821,6 +1821,78 @@ def check_gated_wire_paths_have_resume_test(root, src_root):
              "请补一条 开始->停止->再次开始->能再次收到 的用例。".format(rel, flag))
 
 
+def check_fingerprint_ack_tag_is_validated(root, src_root):
+    """
+    指纹应答在被当作"成功"之前，应校验**包标识**（0x07 = PKT_ACK）。
+
+    背景（跨层契约不一致，第 21 轮发现）：
+    同一个 `fingerprint_hailin.cpp` 里的两条解析路径判据不同：
+      - `autoIdentify()` 显式校验 `(quint8)resp[6] != PKT_ACK` 后才解析；
+      - `stepRegister()` / `stepIdentify()` 只判 `resp.size() < 12 || resp[9] != 0`；
+      - `FingerprintManager` 的识别轮询回调同样只看
+        `resp.size() >= 12 && (quint8)resp[9] == 0x00`。
+
+    后果：串口上任何 "byte[9]==0x00 但包标识不是 0x07" 的字节流
+    （噪声、命令回显、错位后重新同步出的伪帧）都会被误判为"手指已按下"，
+    于是界面直接跳到采集步骤，而实际上根本没有手指。
+
+    为什么只报 WARNING 而不是失败：
+    收紧判据会**改变现场行为**，而本项目对协议的要求是"与 baseline 逐字节
+    兼容"。这不是一个可以单方面由静态检查决定的修复，需要显式决策；
+    当前行为已由 tests/test_fingerprint_manager.cpp 的
+    `commandTagFrameIsNotAValidAck` 钉住，避免被无意改动。
+
+    判定：若某个访问 `resp[N]`（N 为常量）的函数里，读到了确认码语义
+    的下标 9，却没有任何对 `resp[6]` 的包标识比较，则给出警告。
+    """
+    hits = []
+    for path in find_files(src_root, {".cpp"}):
+        text = strip_comments_and_strings(read(path))
+        rel = os.path.relpath(path, root)
+        if "resp" not in text:
+            continue
+        funcs = list(re.finditer(
+            r'^[\w:<>,\s\*&]+\b(\w+)\s*::\s*(\w+)\s*\([^;]*?\)\s*(?:const\s*)?\{',
+            text, re.M))
+        for fi, fm in enumerate(funcs):
+            body_start = fm.end() - 1
+            depth = 0
+            i = body_start
+            while i < len(text):
+                if text[i] == '{':
+                    depth += 1
+                elif text[i] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        break
+                i += 1
+            body = text[body_start:i + 1]
+            fname = fm.group(2)
+
+            # 该函数是否在"读确认码"
+            reads_confirm = re.search(r'\b(resp\w*)\s*\[\s*9\s*\]', body)
+            if not reads_confirm:
+                continue
+            var = reads_confirm.group(1)
+            # 是否校验了包标识：var[6] 与某个 PKT_ACK / 0x07 比较
+            has_tag_check = re.search(
+                r'\b' + re.escape(var) + r'\s*\[\s*6\s*\]', body)
+            if has_tag_check:
+                continue
+            # 反过来：是否校验了"某个东西的[6]"，写法可能是 pkt[6] 等
+            if re.search(r'\[\s*6\s*\]\s*!=\s*PKT_ACK', body):
+                continue
+            line = text.count("\n", 0, body_start) + 1
+            hits.append((rel, line, fname, var))
+
+    for rel, line, fname, var in hits:
+        warn("[fp-ack-tag] {}:{} `{}()` 把 {}[9] 当作确认码，但没有校验包标识 "
+             "{}[6]==0x07(PKT_ACK)。串口噪声或命令回显（byte[9]==0 但标识不是 "
+             "应答）会被误判为『手指已按下』，界面会直接进入采集步骤。"
+             "同文件的 autoIdentify() 是校验了的，两条路径判据不一致。"
+             "收紧判据会改变现场行为，需显式决策，故此处仅告警。"
+             .format(rel, line, fname, var, var))
+
 def check_cross_repo_test_targets_are_unique(root, extra_root):
     """
     两个仓库的测试目标名必须互不冲突，否则**超级工程无法配置**。
@@ -1911,6 +1983,7 @@ def main():
     check_narrowing_cast_of_config(root, src_root)
     check_wire_format_constants_are_pinned(root, src_root)
     check_nonblock_pcm_handles_eagain(root, src_root)
+    check_fingerprint_ack_tag_is_validated(root, src_root)
     check_gated_wire_paths_have_resume_test(root, src_root)
     check_cross_repo_test_targets_are_unique(
         root, sys.argv[2] if len(sys.argv) > 2 else None)
