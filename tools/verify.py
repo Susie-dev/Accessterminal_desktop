@@ -328,6 +328,62 @@ def check_json_configs(root):
                      f"实为 {type(node).__name__}")
 
 
+def check_media_gated_by_answer(root, src_root):
+    """
+    “音视频通道只在用户接听后建立”这一约定的结构化守卫。
+
+    背景：这是与门口机“accept 之前不建流”对称的一条硬约束。室内机在
+    收到 call 时只弹出来电窗口并响铃，**不得**提前绑定 UDP 12345/23456
+    或打开声卡；只有用户把滑块拖到底（engageCall()）才建立通道。
+
+    baseline 中对应的是 Form_phonecall::startAV()，它的唯一调用点是滑块
+    释放处理函数；重构后对应 CallSession::start()，唯一调用点应为
+    Form_phonecall::engageCall()。
+
+    一旦有人把 session->start() 挪到构造函数或 handleCall()，功能上看起来
+    仍然能用（甚至“接听更快”），但空闲时会常驻占用音频设备与 UDP 端口，
+    且没有测试会报警。这里把它变成可强制的检查。
+    """
+    form = os.path.join(src_root, "ui", "form_phonecall.cpp")
+    if not os.path.isfile(form):
+        return
+    text = strip_comments_and_strings(read(form))
+    rel = os.path.relpath(form, root)
+
+    sites = [m.start() for m in re.finditer(r'\bsession\s*->\s*start\s*\(\s*\)', text)]
+    if not sites:
+        fail("[media-gate] {} 找不到 session->start() 调用；"
+             "接听后应建立音视频通道，否则通话无画面无声音".format(rel))
+        return
+
+    # 定位 engageCall() 的函数体范围
+    m = re.search(r'\bForm_phonecall\s*::\s*engageCall\s*\([^)]*\)\s*\{', text)
+    if not m:
+        fail("[media-gate] {} 找不到 Form_phonecall::engageCall() 的定义；"
+             "它是音视频通道唯一的建立入口".format(rel))
+        return
+    start = text.index('{', m.end() - 1)
+    depth = 0
+    i = start
+    while i < len(text):
+        if text[i] == '{':
+            depth += 1
+        elif text[i] == '}':
+            depth -= 1
+            if depth == 0:
+                break
+        i += 1
+    if depth != 0:
+        fail("[media-gate] {} engageCall() 花括号不配平，无法分析".format(rel))
+        return
+
+    for pos in sites:
+        if not (start <= pos <= i):
+            fail("[media-gate] {}:{} session->start() 位于 engageCall() 之外；"
+                 "音视频通道只允许在用户接听后建立，否则空闲时占用声卡与 UDP 端口"
+                 .format(rel, text.count("\n", 0, pos) + 1))
+
+
 def main():
     if len(sys.argv) < 2:
         print("用法: python verify.py <项目根目录>")
@@ -346,6 +402,7 @@ def main():
     check_legacy_identifiers(root, src_root)
     check_qt5_portability(root, src_root)
     check_forward_declarations(root, src_root)
+    check_media_gated_by_answer(root, src_root)
     check_json_configs(root)
 
     print(f"校验目录: {root}")
