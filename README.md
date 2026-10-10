@@ -82,10 +82,26 @@ pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-cmake mingw-w64-x86_64-ninja \
 
 ### 单元测试
 
+作为主工程的一部分构建：
+
 ```sh
 cmake -S . -B build -DACCESSTERMINAL_BUILD_TESTS=ON
 cmake --build build && ctest --test-dir build --output-on-failure
 ```
+
+也可以**独立构建**（不依赖主工程，不需要硬件相关依赖）：
+
+```sh
+cmake -S tests -B /tmp/desktop-tests -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build /tmp/desktop-tests
+ctest --test-dir /tmp/desktop-tests --output-on-failure
+```
+
+> `tests/CMakeLists.txt` 此前缺 `cmake_minimum_required`/`project()`，独立构建
+> 会直接配置失败；补上之后又会因为缺 `enable_testing()` 而"构建成功、
+> `ctest` 一个用例都不跑"。这类失败**只看构建退出码会被误判为通过**。现由
+> `check_subproject_cmake_is_selfcontained` 强制，自检见
+> `tools/verify_subcmake.py`（8/8 用例）。与门口机侧对称修复。
 
 ### 已验证的构建环境
 
@@ -202,7 +218,7 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 
 ## 关键约定（由自动化检查强制）
 
-以下十一条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+以下十二条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
 `tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
 
 ### 1. 音视频通道只在接听后建立
@@ -450,7 +466,26 @@ playFuture = QtConcurrent::run([=]() { ... 捕获 this ... });
 `tools/verify_abandoned_task.py`（5/5 用例）。注意**不误伤即发即忘的用法**：
 不把结果赋给任何变量、且自带 `QPointer` 守卫的任务不存在"被覆盖丢弃"问题。
 
-用 `.clang-format` 统一格式，但**格式不是正确性**——上述十一条请以
+### 12. 可独立构建的子工程 CMake 必须自包含
+
+`tests/CMakeLists.txt` 这类**既能作为主工程的子目录、又能被单独
+`cmake -S tests`** 的文件，必须自带 `cmake_minimum_required()`、`project()`、
+`enable_testing()`，以及 `set(CMAKE_AUTOMOC ON)`（当测试文件里
+`#include "test_xxx.moc"` 时）。作为子目录时这几行幂等，两种用法都安全。
+
+| 必须有 | 缺了会怎样 |
+|---|---|
+| `cmake_minimum_required()` | 配置阶段直接失败 |
+| `project()` | 同上 |
+| `enable_testing()` | **构建成功，`ctest` 报 `No tests were found!!!`** |
+| `set(CMAKE_AUTOMOC ON)` | `fatal error: test_xxx.moc: No such file or directory` |
+
+第三种最危险：构建退出码为 0，看起来一切正常，**实际一个用例都没执行**。
+
+用 `check_subproject_cmake_is_selfcontained` 强制，自检见
+`tools/verify_subcmake.py`（8/8 用例）。
+
+用 `.clang-format` 统一格式，但**格式不是正确性**——上述十二条请以
 `verify.py` 的结果为准。
 
 ---
@@ -477,13 +512,14 @@ python3 tools/check_signatures.py .
 
 # 2b. 校验器自检：对 check_config_value_sanity / check_config_knobs_are_used /
 #     check_declared_signal_is_emitted / check_connect_signal_is_signal /
-#     check_abandoned_async_tasks
+#     check_abandoned_async_tasks / check_subproject_cmake_is_selfcontained
 #     做故障注入。静态规则写错会静默失效，必须证明它真能区分好坏代码。
 python3 tools/verify_config_sanity.py .
 python3 tools/verify_config_knobs.py .
 python3 tools/verify_dead_signal.py .
 python3 tools/verify_connect_signal.py .
 python3 tools/verify_abandoned_task.py .
+python3 tools/verify_subcmake.py .
 
 # 3. 跨仓库协议一致性
 python3 tools/check_protocol_sync.py

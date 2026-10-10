@@ -65,6 +65,79 @@ def check_includes(root, src_root):
                 fail(f"[include] {os.path.relpath(path, root)} -> 无法解析 \"{inc}\"")
 
 
+def check_subproject_cmake_is_selfcontained(root, src_root):
+    """
+    可独立构建的子工程 CMakeLists.txt（tests/、tests/interop/ 等）必须自带
+    `cmake_minimum_required` / `project()`，并有 `enable_testing()` 与
+    `CMAKE_AUTOMOC`（当测试文件 `#include "*.moc"` 时）。
+
+    背景（真实缺陷，本轮修复）：
+    `tests/CMakeLists.txt` 的文件头一直写着可以独立构建：
+
+        cmake -S tests -B /tmp/t113-tests && cmake --build ... && ctest ...
+
+    但它只有 `find_package` + `add_executable` + `add_test`，这三样原本由主
+    CMakeLists.txt 提供。于是独立构建实际上**从来没有成功过**，且失败方式
+    很有迷惑性：
+
+      1. 缺 cmake_minimum_required -> 配置阶段直接失败
+         "No cmake_minimum_required command is present"
+      2. 缺 project() -> 同上（CMake 要求脚本模式之外必须有 project）
+      3. 缺 enable_testing() -> **配置和构建都成功**，但 ctest 报
+         "No tests were found!!!" —— 看起来构建通过了，实际一个用例都没跑
+      4. 缺 AUTOMOC -> 测试文件末尾 `#include "test_xxx.moc"` 找不到
+
+    第 3 种尤其危险：CI 里若只看构建退出码，会以为测试通过了。
+    而"独立构建"恰恰是没有 ALSA/libgpiod 的开发机上唯一能跑单元测试的用法
+    （主工程根 CMakeLists 需要 ALSA，开发机通常没有）。
+
+    判定：子目录里的 CMakeLists.txt（排除顶层那一个）若含 add_test/add_executable
+    却没有 cmake_minimum_required 或 project -> 报错；
+    若含 add_test 却没有 enable_testing -> 报错；
+    若同目录下的 .cpp 里出现 `#include "*.moc"` 却没有 AUTOMOC -> 报错。
+    """
+    top = os.path.join(root, "CMakeLists.txt")
+    for dp, dns, fns in os.walk(root):
+        if ".git" in dp.split(os.sep) or "build" in dp.split(os.sep):
+            continue
+        if "CMakeLists.txt" not in fns:
+            continue
+        p = os.path.join(dp, "CMakeLists.txt")
+        if os.path.normpath(p) == os.path.normpath(top):
+            continue  # 顶层工程由主 CMakeLists 负责
+        rel = os.path.relpath(p, root)
+        text = read(p)
+        if "add_test" not in text and "add_executable" not in text:
+            continue
+
+        if not re.search(r"^\s*cmake_minimum_required\s*\(", text, re.M):
+            fail("[cmake-selfcontained] {} 含 add_executable/add_test 却没有 "
+                 "cmake_minimum_required()：独立执行 `cmake -S {}` 会直接报 "
+                 "\"No cmake_minimum_required command is present\" 而无法配置。"
+                 .format(rel, os.path.dirname(rel) or "."))
+        if not re.search(r"^\s*project\s*\(", text, re.M):
+            fail("[cmake-selfcontained] {} 缺少 project()：独立构建时 CMake 要求"
+                 "顶层脚本必须有 project()，否则配置失败。".format(rel))
+        if "add_test" in text and not re.search(
+                r"^\s*enable_testing\s*\(", text, re.M):
+            fail("[cmake-selfcontained] {} 注册了 add_test 却没有 "
+                 "enable_testing()：独立构建会**配置成功、构建成功**，但 ctest "
+                 "报 \"No tests were found!!!\" —— 一个用例都不会执行，"
+                 "只看构建退出码会误判为通过。".format(rel))
+        # 同目录 .cpp 里有 #include "*.moc" 就必须开 AUTOMOC
+        has_moc_include = False
+        for f in fns:
+            if not f.endswith(".cpp"):
+                continue
+            if re.search(r'#include\s+"[\w]+\.moc"', read(os.path.join(dp, f))):
+                has_moc_include = True
+                break
+        if has_moc_include and not re.search(r"AUTOMOC\s+ON", text):
+            fail("[cmake-selfcontained] {} 同目录的测试文件里有 "
+                 "#include \"*.moc\"，却没有 set(CMAKE_AUTOMOC ON)：会报 "
+                 "fatal error: test_xxx.moc: No such file or directory。"
+                 .format(rel))
+
 def check_build_lists(root, src_root):
     """CMake/pro 里列出的源文件必须存在；实际源文件必须被列出。"""
     cmake = os.path.join(root, "CMakeLists.txt")
@@ -1270,6 +1343,7 @@ def main():
 
     check_includes(root, src_root)
     check_build_lists(root, src_root)
+    check_subproject_cmake_is_selfcontained(root, src_root)
     check_qrc(root, src_root)
     check_ui_objectnames(root, src_root)
     check_balance(root, src_root)
