@@ -2519,6 +2519,95 @@ def check_coverage_separates_dead_from_untested(root, src_root):
 
 
 
+def check_password_log_regression_is_enforced(root, src_root):
+    r"""
+    密码日志安全必须由**运行期测试**守住，且该测试的断言不得为空。
+
+    背景（第 27 轮）
+    ---------------
+    baseline 的 `checkPassword()` 把用户输入、正确密码、以及两者 hex 全打进
+    qDebug（已核对 baseline 源码）。门口机是实体门禁设备，密码是物理准入凭据，
+    qDebug 在嵌入式 Linux 上落 stderr/journal、跨重启留存 —— 输错一次就把
+    密码交了出去。
+
+    重构已修掉，但此前只有一条**静态文本规则**在守。静态规则可能被绕过
+    （改名、拼串、经辅助函数转一手），所以必须有运行期测试。
+
+    而运行期测试有它自己的失效方式 —— **断言恒真**。第 27 轮实测踩到：
+    用环境变量注入非 ASCII 哨兵，而 `AppConfig::toQString()` 是
+    `QString::fromLocal8Bit()`；本机 GBK 下 13 个码元进去、16 个出来，
+    于是"日志里不含哨兵前缀"在比较两个不同的串，**恒真**。是故障注入
+    发现"前缀脱敏"变异抓不到才暴露的。
+
+    因此本规则要求三件事同时存在：
+      1. 测试被接进 tests/CMakeLists.txt（否则写了不跑）；
+      2. **阳性对照** —— 断言非敏感日志确实被捕获（捕获管道坏了要先炸）；
+      3. **夹具自证** —— 断言哨兵原样到达被测代码（跨编码边界必须先证明）。
+
+    能力边界：这是形态检查，**不能**替代真跑一次（"断言写了但写反了"看不出）。
+    它与 tools/verify_password_log_test.py 的故障注入互补。
+    """
+    # 本仓库不适用则直接返回：室内机不持有门禁凭据。
+    # 若照搬门口机那版，会因为找不到 tests/test_password_manager.cpp 而误报。
+    if not os.path.exists(os.path.join(src_root, "managers",
+                                      "password_manager.cpp")):
+        return
+
+    tests_dir = os.path.join(root, "tests")
+    tf = os.path.join(tests_dir, "test_password_manager.cpp")
+    cm = os.path.join(tests_dir, "CMakeLists.txt")
+
+    if not os.path.exists(tf):
+        fail("[password-log] 缺少 tests/test_password_manager.cpp —— 门禁密码的"
+             "日志安全只由静态文本规则守着。静态规则可能被绕过（改名/拼串/"
+             "经辅助函数转一手），必须有一个运行期测试真的抓日志来断言。")
+        return
+
+    if os.path.exists(cm):
+        if "test_password_manager.cpp" not in read(cm):
+            fail("[password-log] tests/test_password_manager.cpp 没有接进 "
+                 "tests/CMakeLists.txt —— 写了但不会跑，等于没有。")
+
+    text = read(tf)
+
+    # 2) 阳性对照：必须有"捕获管道确实工作"的断言。
+    if "MsgCapture::count() > 0" not in text:
+        fail("[password-log] test_password_manager.cpp 缺少**阳性对照**：没有"
+             "断言『确实捕获到了日志』。若消息处理器没装上或日志走了别的通道，"
+             "所有『不包含密码』的断言会一起假成立 —— 测试看着很严，实则零验证。")
+
+    # 3) 夹具自证：哨兵必须原样到达被测代码。
+    #
+    # 注意别把这里写成"永远不触发"的规则（第 22 轮的教训）。第一版写成
+    #     if "Fixture" not in text and "哨兵必须原样" not in text:
+    # 而测试文件的头部注释里恰好含"哨兵必须原样到达被测代码" —— 外层恒 False，
+    # 真正的断言检查永远不可达。**守卫条件不能引用被守卫内容里会出现的字符串。**
+    # 现在直接检查断言本体，并要求它落在一个具名用例里。
+    if "doorPassword(), pwd" not in text:
+        fail("[password-log] test_password_manager.cpp 缺少**夹具自证**：没有"
+             "断言哨兵原样到达被测代码（缺 `doorPassword(), pwd` 这一断言）。"
+             "第 27 轮实测：经环境变量注入非 ASCII 哨兵时，AppConfig 用 "
+             "fromLocal8Bit() 解码，GBK 代码页下 13 个码元进、16 个出，导致"
+             "『日志不含哨兵前缀』恒真 —— 断言在，却什么都没验证。凡夹具跨过一次"
+             "编码边界，必须先断言它没变形。")
+
+    # 4) 前缀脱敏也算泄漏：断言必须覆盖多个前缀，而不是只查一个固定长度。
+    if "password.left(4)" in text or ".left(4) +" in text:
+        pass
+    if "for (int n = 1; n <= secret.size(); ++n)" not in text:
+        warn("[password-log] test_password_manager.cpp 未逐一断言密码的**每个**"
+             "前缀。只查一个固定长度（如 left(4)）会漏掉 left(2)、mid(0,n) 等"
+             "其它脱敏写法，而前缀脱敏对短密码等于全泄。")
+
+    # 5) 故障注入夹具必须在（证明这些断言真的会失败）。
+    fx = os.path.join(root, "tools", "verify_password_log_test.py")
+    if not os.path.exists(fx):
+        fail("[password-log] 缺少 tools/verify_password_log_test.py —— 没有故障"
+             "注入就无法证明这些安全断言**真的会失败**。不失败的回归测试"
+             "没有价值。")
+
+
+
 def check_cross_repo_test_targets_are_unique(root, extra_root):
     """
     两个仓库的测试目标名必须互不冲突，否则**超级工程无法配置**。
@@ -2616,6 +2705,7 @@ def main():
     check_coverage_denominator_is_declared(root, src_root)
     check_tool_scripts_are_console_encoding_safe(root, src_root)
     check_coverage_separates_dead_from_untested(root, src_root)
+    check_password_log_regression_is_enforced(root, src_root)
     check_fake_fingerprint_builds_same_bytes(root, src_root)
     check_fingerprint_checksum_logic_is_not_duplicated(root, src_root)
     check_gated_wire_paths_have_resume_test(root, src_root)
