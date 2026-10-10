@@ -16,6 +16,7 @@
 #include <QPixmap>
 #include <QPushButton>
 #include <QUrl>
+#include <QImage>
 
 Form_phonecall::Form_phonecall(QWidget* parent, bool playRing)
     : QWidget(parent)

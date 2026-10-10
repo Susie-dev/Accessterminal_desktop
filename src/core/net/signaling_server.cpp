@@ -5,6 +5,7 @@
 #include "core/net/signaling_server.h"
 
 #include <QDebug>
+#include <QHostAddress>
 #include <QTcpServer>
 #include <QTcpSocket>
 

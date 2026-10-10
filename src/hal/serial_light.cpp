@@ -7,6 +7,7 @@
 #include "config/app_config.h"
 
 #include <QDebug>
+#include <QSerialPort>
 
 namespace accessterminal {
 

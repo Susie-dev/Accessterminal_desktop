@@ -14,6 +14,7 @@
 
 #include <QByteArray>
 #include <QHostAddress>
+#include <QImage>
 #include <QObject>
 #include <QString>
 

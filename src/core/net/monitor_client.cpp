@@ -8,6 +8,7 @@
 
 #include <QDebug>
 #include <QUdpSocket>
+#include <QPixmap>
 
 namespace accessterminal {
 

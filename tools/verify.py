@@ -196,6 +196,62 @@ def check_legacy_identifiers(root, src_root):
                 fail(f"[legacy] {os.path.relpath(path, root)} 仍含{desc}: {pat}")
 
 
+def check_qt5_portability(root, src_root):
+    """
+    Qt5 版本可移植性检查。
+
+    目标 SDK（Tina Linux）常见为 Qt 5.9~5.12，而开发机可能是 5.15。
+    仅在新版本存在的 API 会让交叉编译在旧 SDK 上失败，这里静态拦截。
+    """
+    # 这些符号在 Qt 5.15 才引入，旧 SDK 上不存在。
+    too_new = [
+        (r'\bQAbstractSocket::errorOccurred\b',
+         "QAbstractSocket::errorOccurred 需要 Qt 5.15+，"
+         "旧写法 QOverload<QAbstractSocket::SocketError>::of(&QTcpSocket::error)"),
+        (r'\bQTcpSocket::errorOccurred\b',
+         "QTcpSocket::errorOccurred 需要 Qt 5.15+，请改用 QOverload 取 error 重载"),
+        (r'\bQNetworkReply::errorOccurred\b',
+         "QNetworkReply::errorOccurred 需要 Qt 5.15+"),
+        (r'\bQSerialPort::errorOccurred\b',
+         "QSerialPort::errorOccurred 需要 Qt 5.15+，请改用 QOverload 取 error 重载"),
+        (r'\bQProcess::errorOccurred\b',
+         "QProcess::errorOccurred 需要 Qt 5.15+"),
+        (r'\bQStringView\b', "QStringView 需要 Qt 5.10+，旧 SDK 可能没有"),
+        (r'\bQMetaType::fromType\b', "QMetaType::fromType 需要 Qt 6"),
+        (r'\bQAudioSink\b|\bQAudioSource\b', "QAudioSink/QAudioSource 是 Qt 6 API，Qt5 用 QAudioOutput/QAudioInput"),
+        (r'\bQMediaPlayer::PlaybackState\b', "QMediaPlayer::PlaybackState 是 Qt 6 API，Qt5 用 QMediaPlayer::State"),
+        # Qt6 用 setSource(QUrl)，Qt5 是 setMedia(QMediaContent)；
+        # 实际写法通常是 player->setSource(...)，故匹配成员调用形式。
+        (r'(?:->|\.)setSource\s*\(', "QMediaPlayer::setSource 是 Qt 6 API，Qt5 用 setMedia"),
+        (r'\bQLibraryInfo::path\b', "QLibraryInfo::path 是 Qt 6 API，Qt5 用 QLibraryInfo::location"),
+        (r'\bQColorSpace\b', "QColorSpace 需要 Qt 5.14+"),
+    ]
+    # C++14/17 特性：本工程为 C++11
+    cpp_too_new = [
+        (r'^\s*inline\s+(?:constexpr|const)\s', "C++17 inline 变量"),
+        (r'\bif\s+constexpr\b', "C++17 if constexpr"),
+        # 结构化绑定形如 auto [a, b] = ...；必须带声明关键字，
+        # 否则会把 lambda 捕获列表 [this, conn](...) 误判。
+        (r'\b(?:const\s+)?auto\s*(?:&|&&)?\s*\[[^\]\n]+\]\s*[=(]',
+         "C++17 结构化绑定"),
+        (r'\bstd::optional\b', "C++17 std::optional"),
+        (r'\bstd::string_view\b', "C++17 std::string_view"),
+        (r'\bstd::make_unique\b', "C++14 std::make_unique"),
+        (r'\bstd::filesystem\b', "C++17 std::filesystem"),
+    ]
+
+    for path in find_files(src_root, {".cpp", ".h"}):
+        raw = read(path)
+        text = strip_comments_and_strings(raw)
+        rel = os.path.relpath(path, root)
+        for pat, desc in too_new:
+            if re.search(pat, text):
+                fail(f"[qt5] {rel} 使用了过高版本的 Qt API: {desc}")
+        for pat, desc in cpp_too_new:
+            if re.search(pat, text, re.M):
+                fail(f"[cxx11] {rel} 使用了 {desc}，本工程为 C++11")
+
+
 def check_json_configs(root):
     """配置文件必须是合法 JSON，且字段类型正确。"""
     import json
@@ -250,6 +306,7 @@ def main():
     check_ui_objectnames(root, src_root)
     check_balance(root, src_root)
     check_legacy_identifiers(root, src_root)
+    check_qt5_portability(root, src_root)
     check_json_configs(root)
 
     print(f"校验目录: {root}")

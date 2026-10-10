@@ -24,6 +24,7 @@
 #include <QRegion>
 #include <QTcpSocket>
 #include <QTimer>
+#include <QPixmap>
 
 using accessterminal::AppConfig;
 using accessterminal::MonitorClient;
