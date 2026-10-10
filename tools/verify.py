@@ -2256,6 +2256,209 @@ def check_coverage_denominator_is_declared(root, src_root):
 
 
 
+def check_fake_fingerprint_builds_same_bytes(root, src_root):
+    r"""
+    链接期替身里的报文构造必须与**生产实现**逐字节一致。
+
+    背景（第 25 轮）
+    ----------------
+    第 20/21 轮用"链接期替身"测指纹流程，前提是"替身里 buildPacket() 是真实
+    算法的逐字节拷贝 —— 报文字节是唯一不能换的契约"。但那个前提**从未被自动
+    验证**，后果有二：
+
+      1. 生产的 buildPacket() 覆盖率是 **0**（它从未被链接进任何测试目标），
+         报文字节实际上没有被任何运行时测试直接验证过；
+      2. 契约被复制成**两份**（生产一份、替身一份），却没有一条检查盯着
+         "两份还一样吗"。有人改了生产的校验和起始下标或长度字段，替身不跟着
+         变，测试照样全绿，而真机报文已经错了。
+
+    这是第 23 轮"平行实现"教训的又一种形态：同一契约的多份副本之间没有契约。
+    本规则把两份实现的**字节写入操作序列**抽出来做归一化比较，任一处不同即失败。
+
+    注意：本规则不是替代单元测试，而是补上"两份副本相互一致性"这一维度 ——
+    单元测试只看替身，看不到生产实现已经漂移。
+    """
+    import re as _re
+
+    prod = os.path.join(root, "src", "hal", "fingerprint_hailin.cpp")
+    fake = os.path.join(root, "tests", "fake_fingerprint_device.cpp")
+    if not os.path.exists(prod) or not os.path.exists(fake):
+        return  # 该仓库没有指纹代码（如桌面端）
+
+    def _strip(text):
+        text = _re.sub(r"/\*[\s\S]*?\*/", "", text)
+        text = _re.sub(r"//[^\n]*", "", text)
+        return text
+
+    def _body(text, sig):
+        i = text.index(sig)
+        j = text.index("{", i)
+        depth, k = 0, j
+        while k < len(text):
+            if text[k] == "{":
+                depth += 1
+            elif text[k] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            k += 1
+        return text[j:k + 1]
+
+    def _ops(body):
+        out = []
+        for m in _re.finditer(
+                r"(\w+)\s*\.\s*append\s*\(\s*(?:\(char\)\s*)?([^;]+?)\s*\)\s*;",
+                body):
+            expr = " ".join(m.group(2).split())
+            expr = _re.sub(r"\bPKT_CMD\b", "0x01", expr)
+            out.append(expr)
+        for m in _re.finditer(r"(?:quint16|const quint16)\s+\w+\s*=\s*([^;]+);",
+                              body):
+            # static_cast<quint16>(x) 与 x 语义等价（payload 远小于 65536）
+            e = " ".join(m.group(1).split())
+            e = _re.sub(r"static_cast<quint16>\s*\(\s*(.*?)\s*\)$", r"\1", e)
+            out.append("LEN=" + e)
+        for m in _re.finditer(
+                r"for\s*\(\s*int\s+\w+\s*=\s*(\d+)\s*;[^;]*;\s*([^)]*)\)",
+                body):
+            out.append("LOOP from=%s step=%s" % (m.group(1),
+                                                 " ".join(m.group(2).split())))
+        return out
+
+    try:
+        ps = _strip(read(prod))
+        fs = _strip(read(fake))
+        po = _ops(_body(ps, "HailinFingerprint::buildPacket("))
+        fo = _ops(_body(fs, "QByteArray buildFrame("))
+    except (ValueError, OSError) as exc:
+        fail("[fake-wire] 无法抽取报文构造实现做比对: %s" % exc)
+        return
+
+    if po != fo:
+        for i in range(max(len(po), len(fo))):
+            a = po[i] if i < len(po) else "<缺失>"
+            b = fo[i] if i < len(fo) else "<缺失>"
+            if a != b:
+                fail("[fake-wire] 替身 tests/fake_fingerprint_device.cpp 的 "
+                     "buildFrame() 与生产 src/hal/fingerprint_hailin.cpp 的 "
+                     "buildPacket() **已经漂移**：第 %d 步 生产=%r 替身=%r。"
+                     "单元测试只跑替身，看不到生产实现已漂移 —— 真机报文会错，"
+                     "而所有指纹测试仍然全绿。" % (i, a, b))
+
+
+def check_fingerprint_checksum_logic_is_not_duplicated(root, src_root):
+    r"""
+    校验和逻辑在同一个文件里**有两份**，且其中一份是死代码 —— 必须显式记录。
+
+    第 25 轮实测：`HailinFingerprint::calcChecksum()` 在生产代码里**零调用者**，
+    而 `buildPacket()` 自己内联了同一个累加循环：
+
+        for (int i = 6; i < pkt.size(); ++i) sum += (quint8)pkt[i];
+
+    实测 baseline（`terminal/smartpronew/HailinFingerprint.cpp`）同样零调用者，
+    所以这是**继承来的**，不是重构引入的缺陷，本轮不改行为。
+
+    但它是一个真实的可维护性隐患：两份拷贝可以各自漂移。第 25 轮的故障注入
+    实测证实了后果 —— 只把 `calcChecksum` 的起始下标从 6 改成 0，**18 个
+    指纹用例全部照常通过**（因为没人调用它）；而若有人"顺手修好"这个死函数
+    并开始调用它，报文校验和就会与 `buildPacket()` 不一致。
+
+    本规则只做**告警并要求显式记录**，不改变行为（改它是否属于"修缺陷"需要
+    产品决策）。已有的 buildPacket 单元测试钉住了实际生效的那一份契约。
+    """
+    import re as _re
+
+    prod = os.path.join(root, "src", "hal", "fingerprint_hailin.cpp")
+    if not os.path.exists(prod):
+        return
+    text = read(prod)
+    loop = "for (int i = 6; i < pkt.size(); ++i) sum += (quint8)pkt[i];"
+    n = text.count(loop)
+    if n < 2:
+        return
+
+    # calcChecksum 是否有调用者？（定义行本身不算）
+    callers = 0
+    for path in find_files(src_root, {".cpp", ".h"}):
+        body = read(path)
+        for m in _re.finditer(r"calcChecksum\s*\(", body):
+            line = body[body.rfind("\n", 0, m.start()) + 1:
+                        body.find("\n", m.start())]
+            if "quint16 HailinFingerprint::calcChecksum" in line:
+                continue          # 定义
+            if _re.match(r"\s*(quint16\s+)?calcChecksum\s*\([^;]*\)\s*;", line):
+                if "HailinFingerprint::" not in line and ":" not in line.split(
+                        "calcChecksum")[0]:
+                    continue      # 头文件里的声明
+            callers += 1
+    if callers == 0:
+        warn("[dup-checksum] src/hal/fingerprint_hailin.cpp 里校验和累加循环出现 "
+             "%d 次，但 HailinFingerprint::calcChecksum() **零调用者** —— "
+             "第二份是死代码。baseline 亦然（继承而来，本轮不改行为）。"
+             "隐患：两份拷贝可各自漂移；故障注入实测「只改死的那份」时 18 个"
+             "指纹用例全部照常通过。若将来启用它，必须与 buildPacket() 的"
+             "累加范围保持一致（自下标 6 起算、不含包头与设备地址）。" % n)
+
+
+
+def check_tool_scripts_are_console_encoding_safe(root, src_root):
+    r"""
+    tools/ 下的自检脚本必须能在本机控制台编码（GBK）下安全输出。
+
+    背景（第 25 轮，代价是两轮误诊）
+    -------------------------------
+    两个故障注入自检脚本里用了 `✓`（U+2713）。本机控制台是 GBK，于是脚本在
+    **打印"已按预期失败 ✓"那一行**抛：
+
+        UnicodeEncodeError: 'gbk' codec can't encode character '\u2713'
+
+    危险之处在于**它伪装成通过**：报告前面的检查结果已经正常输出，看上去一切
+    正常；而 rc=1，若调用方忽略返回码或只看尾部输出，就会被读成"全绿"。
+
+    第 24 轮我遇到同一现象时误诊为"多余参数"问题（因为我当时用 pwsh 且设了
+    `PYTHONIOENCODING=utf-8` 去测，掩盖了真正的编码问题），打了个治症状的补丁。
+    第 25 轮才查出真因。
+
+    规则：脚本要么(a)把 stdout/stderr `reconfigure(encoding="utf-8",
+    errors="replace")`，要么(b)不包含 GBK 编不出来的字符。逐个删符号不算修好 ——
+    下次加一个新符号就会复发。
+    """
+    tools = os.path.join(root, "tools")
+    if not os.path.isdir(tools):
+        return
+
+    seen = 0
+    for fn in sorted(os.listdir(tools)):
+        if not fn.endswith(".py"):
+            continue
+        path = os.path.join(tools, fn)
+        text = read(path)
+        seen += 1
+
+        if 'reconfigure(encoding="utf-8"' in text:
+            continue
+
+        bad = set()
+        for ch in text:
+            if ord(ch) < 128:
+                continue
+            try:
+                ch.encode("gbk")
+            except UnicodeEncodeError:
+                bad.add(ch)
+        if bad:
+            fail("[tool-encoding] tools/%s 含本机 GBK 控制台**无法编码**的字符 "
+                 "%r，且没有把 stdout 重配为 utf-8。脚本会在打印结果时抛 "
+                 "UnicodeEncodeError —— 而前面的输出看起来一切正常，"
+                 "极易被误读成「通过」。修法：加 "
+                 "sys.stdout.reconfigure(encoding='utf-8', errors='replace')，"
+                 "不要逐个删符号（下次加新符号会复发）。"
+                 % (fn, "".join(sorted(bad))))
+    if seen == 0:
+        warn("[tool-encoding] tools/ 下没有找到任何 .py 脚本？")
+
+
+
 def check_cross_repo_test_targets_are_unique(root, extra_root):
     """
     两个仓库的测试目标名必须互不冲突，否则**超级工程无法配置**。
@@ -2351,6 +2554,9 @@ def main():
     check_declared_slot_is_reachable(root, src_root)
     check_live_fingerprint_enroll_sequence_is_pinned(root, src_root)
     check_coverage_denominator_is_declared(root, src_root)
+    check_tool_scripts_are_console_encoding_safe(root, src_root)
+    check_fake_fingerprint_builds_same_bytes(root, src_root)
+    check_fingerprint_checksum_logic_is_not_duplicated(root, src_root)
     check_gated_wire_paths_have_resume_test(root, src_root)
     check_cross_repo_test_targets_are_unique(
         root, sys.argv[2] if len(sys.argv) > 2 else None)
