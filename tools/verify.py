@@ -2214,6 +2214,48 @@ def check_live_fingerprint_enroll_sequence_is_pinned(root, src_root):
 
 
 
+def check_coverage_denominator_is_declared(root, src_root):
+    r"""
+    覆盖率必须连**分母**一起声明，否则数字本身具有误导性。
+
+    背景（第 24 轮首次量化覆盖率时发现）：
+    本工程第一次跑 gcov 得到 "94.4%" —— 看上去产线代码几乎都被测过。
+    但那个分母只含**被链接进测试目标的 17 个文件**。另有 20 个产线源文件
+    （约 2093 行，含 ui/widget.cpp 678 行、hal/fingerprint_hailin.cpp 332 行、
+    ui/form_finger.cpp 162 行）从未被任何测试目标链接，根本不出现在 gcov
+    数据里，分母被悄悄缩小。把未测文件折进分母后，真实覆盖率约 **22%**。
+
+    这与第 30 条"被测对象不在执行路径上"是同一类错误的不同表现：
+    前者是测试没落在产线代码上，后者是**统计口径**没把未测代码算进去。
+    数字正确、口径错误，比没数字更危险 —— 它会让人停止寻找缺口。
+
+    判定：tools/coverage_report.py 必须
+      1. 存在；
+      2. 显式列出"从未被任何测试目标链接的产线源文件"；
+      3. 给出把未测文件折进分母后的总覆盖率（而不是只报已测文件的百分比）。
+
+    这三条保证任何人都无法只引用那个漂亮的小分母数字。
+    """
+    import re as _re
+    rep = os.path.join(root, "tools", "coverage_report.py")
+    if not os.path.exists(rep):
+        fail("[coverage-denominator] 缺少 tools/coverage_report.py —— "
+             "覆盖率必须可复现，不能只在会话里手算。")
+        return
+    text = read(rep)
+    checks = [
+        (r"从未被任何测试目标链接", "未列出'从未被链接'的产线文件清单"),
+        (r"不自我美化的总覆盖率", "未给出折入未测文件后的真实总覆盖率"),
+        (r"近似总覆盖率", "未输出真实总覆盖率数值"),
+    ]
+    for pat, why in checks:
+        if not _re.search(pat, text):
+            fail("[coverage-denominator] tools/coverage_report.py {}。"
+                 "只报'已测文件'的百分比会让人误以为产线代码已被覆盖 —— "
+                 "第 24 轮实测：小分母下是 94.4%，真实值约 22%。".format(why))
+
+
+
 def check_cross_repo_test_targets_are_unique(root, extra_root):
     """
     两个仓库的测试目标名必须互不冲突，否则**超级工程无法配置**。
@@ -2308,6 +2350,7 @@ def main():
     check_signalspy_types_are_registered(root, src_root)
     check_declared_slot_is_reachable(root, src_root)
     check_live_fingerprint_enroll_sequence_is_pinned(root, src_root)
+    check_coverage_denominator_is_declared(root, src_root)
     check_gated_wire_paths_have_resume_test(root, src_root)
     check_cross_repo_test_targets_are_unique(
         root, sys.argv[2] if len(sys.argv) > 2 else None)
