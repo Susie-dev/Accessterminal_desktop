@@ -202,7 +202,7 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 
 ## 关键约定（由自动化检查强制）
 
-以下七条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+以下八条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
 `tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
 
 ### 1. 音视频通道只在接听后建立
@@ -348,7 +348,27 @@ int ringtoneVolume() const { return clampInt(m_ringtoneVolume, 0, 100); }
 有故障注入自检（`tools/verify_config_sanity.py`，6/6 用例）——静态规则
 写错会静默失效，必须证明它真的能区分好坏代码。
 
-用 `.clang-format` 统一格式，但**格式不是正确性**——上述七条请以
+### 8. 配置里公开的开关必须真的生效
+
+第 7 条管的是「配置值不合理会崩」，本条管的是「配置值根本没人用」。
+
+门口机已经踩过这个坑：`behavior.face_confidence_threshold` 配置项与访问器
+都在，但 `FaceManager::recognize()` 里仍是硬编码 `confidence < 90`，现场把
+阈值从 90 调到 60 **毫无变化**。这类「假旋钮」不崩溃、不告警，只让调参
+永远无效，是最难发现的一类重构退化。
+
+本工程同类风险最高的是 `signaling_port`：若它在 `widget.cpp` 的消费点
+（`m_signaling->listen(cfg.signalingPort())`）被误删，门口机就再也连不上，
+而程序不会报任何错。
+
+由 `check_config_knobs_are_used` 强制，自检见
+`tools/verify_config_knobs.py`（6/6 用例）。判据是「访问器在
+`app_config.*` 之外被调用，**或**其成员在加载代码之外被读取」——
+后一条是为了不误伤有效配置。特别地，**加载代码里的读取不算消费**：
+`m_x = jsonInt(o, "x", m_x)` 只是回退实参，若把它算作消费，假旋钮就会被
+漏掉（该规则第一版正是这样漏掉了门口机的 `faceConfidenceThreshold`）。
+
+用 `.clang-format` 统一格式，但**格式不是正确性**——上述八条请以
 `verify.py` 的结果为准。
 
 ---
@@ -373,9 +393,11 @@ python3 tools/verify.py .
 # 2. 签名一致性（.h 声明 vs .cpp 定义）
 python3 tools/check_signatures.py .
 
-# 2b. 校验器自检：对 check_config_value_sanity 做故障注入（6/6 用例）
-#     静态规则写错会静默失效，用故障注入证明它真的能区分好坏代码。
+# 2b. 校验器自检：对 check_config_value_sanity / check_config_knobs_are_used
+#     做故障注入（各 6/6 用例）。静态规则写错会静默失效，必须证明它真能
+#     区分好坏代码。
 python3 tools/verify_config_sanity.py .
+python3 tools/verify_config_knobs.py .
 
 # 3. 跨仓库协议一致性
 python3 tools/check_protocol_sync.py
