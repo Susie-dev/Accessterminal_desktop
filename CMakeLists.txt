@@ -147,4 +147,30 @@ option(ACCESSTERMINAL_BUILD_TESTS "构建单元测试" OFF)
 if(ACCESSTERMINAL_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
+
+    # -----------------------------------------------------------------------
+    # main.cpp 的进程级冒烟测试。
+    #
+    # 它是本工程唯一**无法**被链接进测试二进制的产线 .cpp —— 它自己定义了
+    # main()，链接进任何 QTest 目标都会撞名。所以只能从进程外面验：用一份
+    # 隔离配置启动它，断言
+    #   (1) 日志里出现 "服务端监听端口 <我们指定的端口>"
+    #       => 配置确实在 Widget / 各模块构造**之前**载入（顺序错了就是 8887）；
+    #   (2) 启动后进程仍然活着 => 确实走到了 app.exec()
+    #       （去掉它进程会立刻退出）；
+    #   (3) 不带参数启动时走"内置默认值"分支。
+    # 详见 tools/smoke_main.py 顶部说明。
+    # 注意：这条只在**主工程**里注册（`cmake -S . -DACCESSTERMINAL_BUILD_TESTS=ON`）。
+    # 单独构建 tests/（`cmake -S tests`）时没有 smartserver 目标，故不注册。
+    # -----------------------------------------------------------------------
+    find_program(ACC_PYTHON3 NAMES python3 python)
+    if(ACC_PYTHON3)
+        add_test(NAME desktop_main_smoke
+                 COMMAND ${ACC_PYTHON3}
+                         ${CMAKE_CURRENT_SOURCE_DIR}/tools/smoke_main.py
+                         $<TARGET_FILE:smartserver>)
+        set_tests_properties(desktop_main_smoke PROPERTIES TIMEOUT 120)
+    else()
+        message(STATUS "未找到 python3，跳过 main.cpp 冒烟测试")
+    endif()
 endif()
