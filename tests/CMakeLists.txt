@@ -31,7 +31,7 @@ set(CMAKE_AUTOMOC ON)
 # 独立构建时必须自己启用测试注册，否则 add_test() 不生效。
 enable_testing()
 
-find_package(Qt5 5.12 REQUIRED COMPONENTS Core Test Network Gui)
+find_package(Qt5 5.12 REQUIRED COMPONENTS Core Test Network Gui Widgets)
 
 # 作为子目录被主工程引入时 CMAKE_SOURCE_DIR 指向主工程根，src 在其下；
 # 独立构建时 CMAKE_SOURCE_DIR 就是 tests/，src 在上一级。两种都要能工作。
@@ -304,3 +304,76 @@ target_link_libraries(desktop_test_call_session PRIVATE
 )
 
 add_test(NAME desktop_call_session COMMAND desktop_test_call_session)
+
+# ---------------------------------------------------------------------------
+# Widget：室内机主窗口（383 行，此前从未被任何测试目标链接过）
+#
+# 这是【P1】里最大的覆盖缺口，也是唯一同时牵动三条链路的门面：
+#   - 信令编排：call/stopsend 的开窗关窗，以及 accepted/hangupClicked 必须
+#     逐字节回 accept\n / recstop\n（室内机->门口机方向的线上字节）；
+#   - 开锁广播：unlock\n 发给所有在线门口机；
+#   - 监看生命周期：toggle 的开关，以及**退出程序时是否通知门口机 stop**
+#     （MonitorClient::stop() 落实，但触发路径正是本文件的 Widget 析构）。
+#
+# 按钮槽全部靠 uic 的 connectSlotsByName 自动接线，所以测试**点击真实按钮**
+# 来驱动：槽名与 objectName 不匹配、或被显式 connect 了第二次（P2 的"退格
+# 双删"），都会直接变成用例失败。
+#
+# 影子头（两处，都是"只替最外层、被测 .cpp 一个字节不改"）：
+#   1. tests/fake_serial_port/QSerialPort —— 替掉串口（沿用 serial_light 目标
+#      已有的替身，define ACC_SERIAL_LIGHT_TEST），serial_light.cpp 是真的；
+#   2. tests/shadows/ui/form_phonecall.h —— 替掉通话浮层（define
+#      ACC_WIDGET_TEST），避开 Qt5::Multimedia 与 CallSession，本目标因此
+#      **不需要** Qt5::Multimedia。
+# 影子头必须列进源列表，AUTOMOC 才会为它们生成元对象（AUTOMOC 不看
+# include 目录，漏了会在链接期报 undefined reference to staticMetaObject）。
+#
+# 网络/串口/天气全部隔离：每个用例现取空闲信令端口写进临时 JSON 再 load，
+# 天气 URL 置空（refresh() 早退），门口机地址设为 127.0.0.2，UDP 50000 由
+# 测试内的替身门口机接收。
+# ---------------------------------------------------------------------------
+qt5_wrap_ui(DESKTOP_WIDGET_UIS
+    ${ACCESSTERMINAL_SRC_ROOT}/ui/widget.ui
+)
+
+add_executable(desktop_test_widget
+    test_widget.cpp
+    fake_form_phonecall.cpp
+    fake_serial_port.cpp
+    # 影子头必须列进来，AUTOMOC 才会为它们生成元对象。
+    ${CMAKE_CURRENT_LIST_DIR}/shadows/ui/form_phonecall.h
+    ${ACCESSTERMINAL_SRC_ROOT}/ui/widget.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/config/app_config.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/core/net/signaling_server.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/core/net/monitor_client.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/core/weather/weather_service.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/hal/serial_light.cpp
+    ${DESKTOP_WIDGET_UIS}
+)
+
+# BEFORE：影子 ui/form_phonecall.h 与影子 QSerialPort 都必须排在真头之前命中。
+target_include_directories(desktop_test_widget BEFORE PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/shadows
+    ${CMAKE_CURRENT_LIST_DIR}/fake_serial_port
+)
+
+target_include_directories(desktop_test_widget PRIVATE
+    ${ACCESSTERMINAL_SRC_ROOT}
+    ${CMAKE_CURRENT_LIST_DIR}
+    ${CMAKE_CURRENT_BINARY_DIR}                   # ui_widget.h（uic 产物）
+)
+
+target_compile_definitions(desktop_test_widget PRIVATE
+    ACC_WIDGET_TEST
+    ACC_SERIAL_LIGHT_TEST
+)
+
+target_link_libraries(desktop_test_widget PRIVATE
+    Qt5::Core
+    Qt5::Test
+    Qt5::Network
+    Qt5::Gui
+    Qt5::Widgets
+)
+
+add_test(NAME desktop_widget COMMAND desktop_test_widget)
