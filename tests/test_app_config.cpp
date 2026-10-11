@@ -19,11 +19,30 @@
 #include <QByteArray>
 #include <QDir>
 #include <QFile>
+#include <QStringList>
 #include <QTemporaryDir>
 
 #include "config/app_config.h"
 
 using accessterminal::AppConfig;
+
+namespace {
+
+/// 捕获 qWarning，用于断言"配置解析该不该告警"。
+///
+/// 必须看日志、不能只看 `lightCommand()` 的返回值：注释键**无论是否被跳过**
+/// 都不会进 `m_lightCommands`（解析失败本来就不插入），唯一的可观测差异就是
+/// 那条告警 —— 只断言返回值会得到一条毫无判别力的"永远通过"。
+QStringList g_warnings;
+
+void captureWarnings(QtMsgType type, const QMessageLogContext&, const QString& msg)
+{
+    if (type == QtWarningMsg) {
+        g_warnings.append(msg);
+    }
+}
+
+} // namespace
 
 class TestAppConfig : public QObject
 {
@@ -36,6 +55,7 @@ private slots:
     void rejectsEmptyAndGarbage();
     void acceptsValidForms();
     void badCommandKeepsDefaultInsteadOfCorrupting();
+    void commentKeysInLightsAreNotTreatedAsCommands();
 
     // ---- 数值配置兜底（与门口机对称；第 8/9 轮的缺陷类别）----
     void clampHelpersBoundaries();
@@ -374,6 +394,82 @@ void TestAppConfig::badCommandKeepsDefaultInsteadOfCorrupting()
     // 关键：内容与真实指令完全不同（错位重排）。
     QVERIFY(corrupted != QByteArray::fromHex("FD034C12045DDF"));
     QCOMPARE(corrupted.toHex(), QByteArray("0fd04c12045ddf"));
+}
+
+/**
+ * `lights` 段里以 '_' 开头的键是**注释**，不是灯控指令。
+ *
+ * JSON 没有注释语法，本工程的 config/appconfig.json 各段都靠 "_comment" 承载
+ * 说明。修复前实测：`lights` 段是**按键遍历**的，于是 "_comment" 的中文说明
+ * 被送进 parseHexBytes()，必然判为非法，**每次启动**都打：
+ *     [配置] 灯控指令格式非法，已忽略: "_comment"
+ * 既是噪声，又会让现场去追一个不存在的配置错误；更糟的是真正需要被看见的
+ * 指令解析失败会被同一条文案盖住。
+ *
+ * 这里把"有没有打这条假告警"变成断言，并配**阳性对照**：真正非法的指令值
+ * 仍然必须告警 —— 否则"干脆不告警"也能让第一条通过。
+ */
+void TestAppConfig::commentKeysInLightsAreNotTreatedAsCommands()
+{
+    QTemporaryDir dir;
+    QVERIFY(dir.isValid());
+
+    const QString good = dir.filePath(QStringLiteral("good.json"));
+    {
+        QFile f(good);
+        QVERIFY(f.open(QIODevice::WriteOnly));
+        // 刻意用一个**没有内置默认值**的键（lamp2）：这样"配置里的指令有没有
+        // 真的写进指令表"才可观测。若只用 desk/work 等键，applyDefaults() 已经
+        // 把同样的值填好了，把 insert 整行删掉都看不出区别（实测踩过）。
+        // 值里带空格，顺带覆盖 parseHexBytes 的清洗分支。
+        f.write("{\"lights\":{\"_comment\":\"这是一句注释，不是指令\","
+                "\"lamp2\":\"AA BB CC\"}}");
+        f.close();
+    }
+
+    g_warnings.clear();
+    QtMessageHandler prev = qInstallMessageHandler(captureWarnings);
+    AppConfig& cfg = AppConfig::instance();
+    cfg.load(good);
+    qInstallMessageHandler(prev);
+
+    // 注释键不得进指令表，也不得产生"格式非法"告警。
+    QVERIFY2(cfg.lightCommand(QStringLiteral("_comment")).isEmpty(),
+             "注释键不该被当成灯控指令");
+    for (const QString& w : g_warnings) {
+        QVERIFY2(!w.contains(QStringLiteral("_comment")),
+                 qPrintable(QStringLiteral("注释键不该被告警: ") + w));
+    }
+    // 配置里的指令必须真的写进表（只有非默认键能证明这一点）。
+    QCOMPARE(cfg.lightCommand(QStringLiteral("lamp2")),
+             QByteArray::fromHex("AABBCC"));
+    // 内置默认值仍在（不被"半套配置"抹掉）。
+    QCOMPARE(cfg.lightCommand(QStringLiteral("desk")),
+             QByteArray::fromHex("FD034C12045DDF"));
+
+    // 阳性对照：真正非法的指令值仍然必须告警。
+    const QString bad = dir.filePath(QStringLiteral("bad.json"));
+    {
+        QFile f(bad);
+        QVERIFY(f.open(QIODevice::WriteOnly));
+        f.write("{\"lights\":{\"desk\":\"ZZZZ\"}}");
+        f.close();
+    }
+    g_warnings.clear();
+    prev = qInstallMessageHandler(captureWarnings);
+    cfg.load(bad);
+    qInstallMessageHandler(prev);
+
+    bool warned = false;
+    for (const QString& w : g_warnings) {
+        if (w.contains(QStringLiteral("格式非法")) && w.contains(QStringLiteral("desk"))) {
+            warned = true;
+        }
+    }
+    QVERIFY2(warned, "真正非法的灯控指令值仍然必须告警（阳性对照）");
+    // 且非法值**不得覆盖内置默认值**（applyDefaults 先跑，解析失败就保留默认）。
+    QCOMPARE(cfg.lightCommand(QStringLiteral("desk")),
+             QByteArray::fromHex("FD034C12045DDF"));
 }
 
 QTEST_MAIN(TestAppConfig)

@@ -236,6 +236,17 @@ bool AppConfig::load(const QString& filePath)
         // 灯控指令允许通过配置覆盖，便于现场调整。
         const QJsonObject lights = jsonObject(root, QStringLiteral("lights"));
         for (auto it = lights.constBegin(); it != lights.constEnd(); ++it) {
+            // 以 '_' 开头的键是**注释**约定：JSON 没有注释语法，本工程的
+            // config/appconfig.json 各段就都写了 "_comment"。
+            //
+            // 不跳过会怎样（实测）："_comment" 的值是一段中文说明，被当成一条
+            // 灯控指令送进 parseHexBytes()，必然判为非法，于是**每次启动**都打
+            //     [配置] 灯控指令格式非法，已忽略: "_comment"
+            // 这既是噪声，又会把现场排障引向一个根本不存在的配置错误 ——
+            // 而真正需要被看见的那条解析失败会被同样的文案盖住。
+            if (it.key().startsWith(QLatin1Char('_'))) {
+                continue;
+            }
             if (!it.value().isString()) {
                 continue;
             }
