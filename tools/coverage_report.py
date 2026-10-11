@@ -76,7 +76,19 @@ def collect(repo_root, build_dir, gcov_bin):
             rel = os.path.relpath(fname, repo_root)
             bucket = lines.setdefault(rel, {})
             for ln in fobj.get("lines", []):
-                if not ln.get("block_ids"):
+                # `block_ids` 是 **GCC 12+/JSON v2** 才有的字段：新格式会用
+                # `"block_ids": []` 显式标出"这一行不属于任何基本块"（纯声明行，
+                # 计数无意义），故跳过。
+                #
+                # 但 GCC 9~11 的 `gcov -j` **根本不输出这个字段**。原先写成
+                # `if not ln.get("block_ids"): continue`，在旧格式下对**每一行**
+                # 都为真 —— 于是所有文件的可执行行都变成 0、总覆盖率恒为 0.0%，
+                # 而报表本身看起来"正常跑完了"。实测本机 GCC 11.4.0 就是这种：
+                # 12 个文件全部"可执行行 0"，总覆盖率 0.0%。
+                # 修法：只在字段**存在且为空**时跳过；字段缺失（旧格式）说明
+                # gcov 只为有计数器的行建了记录，按可执行行计入。
+                bids = ln.get("block_ids")
+                if bids is not None and not bids:
                     continue          # 纯声明行，命中数无意义
                 n = ln.get("line_number")
                 c = ln.get("count", 0)
