@@ -377,3 +377,70 @@ target_link_libraries(desktop_test_widget PRIVATE
 )
 
 add_test(NAME desktop_widget COMMAND desktop_test_widget)
+
+# ---------------------------------------------------------------------------
+# Form_phonecall：通话/来电浮层（207 行，此前从未被链接过）
+#
+# 【P1】第 2 项。它是室内机信令链路的关键一环：
+#   - 滑块拖到最右 -> engageCall() -> 发 accepted/answered（accepted 被
+#     Widget 翻译成线上字节 accept\n），拖不到底就不该接通；
+#   - 挂断按钮 -> hangupClicked（线上 recstop\n）+ close()；
+#   - 接通才 CallSession::start()，关窗/析构必须 stop()；
+#   - 响铃循环靠 stateChanged == StoppedState 时重新 play()；
+#     playRing=false 时必须一个播放器都不建（"离线不响铃"）。
+#
+# 交互用**真实鼠标事件**驱动（往 label_slider 发按下/移动/松开三件套），
+# 走的是 eventFilter 的产线路径，而不是直接调私有的 engageCall()。
+#
+# 影子头（两处）：
+#   1. tests/fake_media/QMediaPlayer —— 替掉 Qt5::Multimedia 的播放器。
+#      本目标因此**不需要** Qt5::Multimedia，也不碰开发机的声卡。
+#   2. tests/shadows_form/core/media/call_session.h —— 替掉音视频通道。
+#      通道本身由 desktop_test_call_session（真实 socket + 声卡替身）单独
+#      覆盖，这里只验浮层对它的编排（start/stop/收帧），于是本目标不占用
+#      UDP 12345 / 23456，可与其它目标并行。
+# 两个影子头都有 Q_OBJECT（要 connect stateChanged / videoFrameReady），
+# 必须列进源列表，否则 AUTOMOC 不给它们生成元对象。
+# 安全阀：未定义 ACC_FORM_PHONECALL_TEST 时影子头直接 #error。
+# ---------------------------------------------------------------------------
+qt5_wrap_ui(DESKTOP_FORM_PHONECALL_UIS
+    ${ACCESSTERMINAL_SRC_ROOT}/ui/form_phonecall.ui
+)
+
+add_executable(desktop_test_form_phonecall
+    test_form_phonecall.cpp
+    fake_media.cpp
+    # 影子头必须列进来，AUTOMOC 才会为它们生成元对象。
+    # 注意 QMediaPlayer 本体是 shadow_qmediaplayer.h：AUTOMOC **不认无扩展名的
+    # 头**，把带 Q_OBJECT 的类写在无扩展名的 QMediaPlayer 里会链接失败。
+    ${CMAKE_CURRENT_LIST_DIR}/fake_media/shadow_qmediaplayer.h
+    ${CMAKE_CURRENT_LIST_DIR}/shadows_form/core/media/call_session.h
+    ${ACCESSTERMINAL_SRC_ROOT}/ui/form_phonecall.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/ui/slidehintwidget.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/config/app_config.cpp
+    ${DESKTOP_FORM_PHONECALL_UIS}
+)
+
+target_include_directories(desktop_test_form_phonecall BEFORE PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/shadows_form
+    ${CMAKE_CURRENT_LIST_DIR}/fake_media
+)
+
+target_include_directories(desktop_test_form_phonecall PRIVATE
+    ${ACCESSTERMINAL_SRC_ROOT}
+    ${CMAKE_CURRENT_LIST_DIR}
+    ${CMAKE_CURRENT_BINARY_DIR}                   # ui_form_phonecall.h（uic 产物）
+)
+
+target_compile_definitions(desktop_test_form_phonecall PRIVATE
+    ACC_FORM_PHONECALL_TEST
+)
+
+target_link_libraries(desktop_test_form_phonecall PRIVATE
+    Qt5::Core
+    Qt5::Test
+    Qt5::Gui
+    Qt5::Widgets
+)
+
+add_test(NAME desktop_form_phonecall COMMAND desktop_test_form_phonecall)

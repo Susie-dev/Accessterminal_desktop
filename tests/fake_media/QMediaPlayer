@@ -1,0 +1,25 @@
+/**
+ * @file QMediaPlayer
+ * @brief **测试专用**的 `QMediaPlayer` 影子头（转发壳）。
+ *
+ * 本文件的名字必须**恰好**是 `QMediaPlayer`（无扩展名），因为真 Qt 头就是
+ * 这个名字，`#include <QMediaPlayer>` 只按文件名精确匹配。
+ * 用 `target_include_directories(... BEFORE PRIVATE ...)` 把它插到 Qt 的
+ * include 路径之前，于是 `#include <QMediaPlayer>` 命中这里。
+ *
+ * 为什么它自己不写类定义：AUTOMOC **不认无扩展名的头**，把带 Q_OBJECT 的类
+ * 直接写在这里，链接期会报 `undefined reference to
+ * QMediaPlayer::staticMetaObject` / `stateChanged` / `vtable for QMediaPlayer`。
+ * 所以类定义放在 shadow_qmediaplayer.h，由本文件转发，并把那个 .h 列进
+ * `add_executable` 源列表。详见 shadow_qmediaplayer.h 顶部说明。
+ *
+ * 为什么必须替掉真 QMediaPlayer：真品属 Qt5::Multimedia，会拖进
+ * GStreamer/后端插件并**真的去打开音频设备**，让单元测试的结果取决于开发机
+ * 有没有声卡、是否被独占。被测量（门铃音地址、音量、循环播放）与后端无关。
+ */
+#ifndef ACCESSTERMINAL_TESTS_FAKE_QMEDIAPLAYER_H
+#define ACCESSTERMINAL_TESTS_FAKE_QMEDIAPLAYER_H
+
+#include "shadow_qmediaplayer.h"
+
+#endif // ACCESSTERMINAL_TESTS_FAKE_QMEDIAPLAYER_H
