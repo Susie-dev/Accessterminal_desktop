@@ -54,10 +54,12 @@ UDP 50000 是**协议硬约束**的一员，而它的语义与另外三条都不
   - 去掉 `ShareAddress | ReuseAddressHint`：端口空闲时独占绑定同样成功，
     行为无差别（探针实测），没有判别力，故不列为变异。
 """
+import atexit
 import io
 import os
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
 # 注意：判定 FAIL 行只看行首 ``FAIL!``，**不要**去匹配用例名的形状。
@@ -129,6 +131,58 @@ def read_src():
 _ORIG = read_src()
 
 
+# ---------------------------------------------------------------------------
+# 崩溃安全：本夹具是**就地改写真实源码**再还原的（src/core/net/monitor_client.cpp
+# 就是工作区里那个文件）。原先每个变异的还原写在循环体**末尾**，一旦两次
+# 写盘之间有异常（构建目录被删 -> Popen(cwd=D) 抛 FileNotFoundError、Ctrl-C、
+# 断电、磁盘满……），异常会直接穿出循环，**还原那行永远执行不到**，
+# 于是"变异态"就被永久留在工作区里 —— 而工作区此时看起来完全正常，
+# 直到有人跑 tools/verify.py 才炸出一条莫名其妙的失败。
+#
+# 实测踩坑：一次运行因仓库目录被外部改名而抛 FileNotFoundError，
+# 恰好卡在 UNDETECTABLE 的"去掉 resize 缩容"变异上，源码里的
+# `if (bytesRead < datagram.size())` 就这么丢了一整天，verify.py 报红。
+#
+# 因此：把还原登记为**最优先的退出钩子**。atexit 在正常退出与 sys.exit 时
+# 都会跑（LIFO，故注册在最后也无妨——这里只有这一个钩子），
+# 信号钩子再兜住 SIGINT/SIGTERM 这类不触发 atexit 的情形。
+# 还原是**幂等**的：写回 _ORIG 的原始字节，无论当前是不是变异态都安全。
+# ---------------------------------------------------------------------------
+def restore_src():
+    """把源码写回运行本夹具之前捕获的原始字节（幂等）。"""
+    try:
+        current = read_src()
+    except Exception:
+        return
+    if current != _ORIG:
+        try:
+            io.open(SRC, 'w', encoding='utf-8',
+                    newline='\n').write(_ORIG)
+            print('\n[崩溃安全] 已把 %s 还原为运行前的原始内容'
+                  % os.path.relpath(SRC, D))
+        except Exception as exc:  # 还原失败必须吼出来，不能静默
+            print('\n[崩溃安全][严重] 源码还原失败，工作区可能残留变异态: %r'
+                  % (exc,))
+
+
+atexit.register(restore_src)
+
+
+def _restore_on_signal(signum, _frame):
+    restore_src()
+    # 恢复默认处置再自杀，让退出码正确反映"被信号打断"。
+    signal.signal(signum, signal.SIG_DFL)
+    os.kill(os.getpid(), signum)
+
+
+for _sig in (getattr(signal, 'SIGINT', None), getattr(signal, 'SIGTERM', None)):
+    if _sig is not None:
+        try:
+            signal.signal(_sig, _restore_on_signal)
+        except (ValueError, OSError):
+            pass  # 非主线程等场景下装不上，atexit 仍兜底
+
+
 def anchor(start_marker):
     """从**真实文件字节**里切出一个**完整的块**（花括号配对到收尾）。
 
@@ -157,8 +211,17 @@ STOP_LIT = 'const QByteArray kStop = QByteArrayLiteral("stop");'
 
 SEND_GETFRAME = ('        m_socket->writeDatagram(kGetFrame, m_deviceAddress, '
                  'protocol::kPreviewPort);')
-SEND_STOP = ('        m_socket->writeDatagram(kStop, m_deviceAddress, '
-             'protocol::kPreviewPort);')
+
+# `writeDatagram(kStop, ...)` 这条语句现在出现**两次**：toggle() 的 else 分支
+# 一次、stop() 里一次（后者是"退出时通知门口机停推"的修复）。两行的缩进与
+# 文本完全相同，所以裸语句**不再是唯一锚点** —— 夹具的锚点唯一性自证会直接
+# 报"[夹具错误] ... 锚点出现 2 次"。因此各带上一行独有的上下文来区分。
+SEND_STOP_IN_TOGGLE = ('    } else {\n'
+                       '        m_socket->writeDatagram(kStop, m_deviceAddress, '
+                       'protocol::kPreviewPort);')
+SEND_STOP_IN_STOP = ('    if (m_active && m_socket) {\n'
+                     '        m_socket->writeDatagram(kStop, m_deviceAddress, '
+                     'protocol::kPreviewPort);')
 
 TOGGLE_IF = '    if (!m_active) {'
 STOP_BODY = anchor('void MonitorClient::stop()')
@@ -205,16 +268,32 @@ MUT = [
      SEND_GETFRAME.replace('protocol::kPreviewPort', '50001')),
 
     ("stop 发到错误端口 50001",
-     SEND_STOP,
-     SEND_STOP.replace('protocol::kPreviewPort', '50001')),
+     SEND_STOP_IN_TOGGLE,
+     SEND_STOP_IN_TOGGLE.replace('protocol::kPreviewPort', '50001')),
 
     ("首次 toggle 反而发 stop（开关逻辑反了）",
      '        m_socket->writeDatagram(kGetFrame,',
      '        m_socket->writeDatagram(kStop,'),
 
     ("再次 toggle 反而发 getframe",
-     '        m_socket->writeDatagram(kStop,',
-     '        m_socket->writeDatagram(kGetFrame,'),
+     SEND_STOP_IN_TOGGLE,
+     SEND_STOP_IN_TOGGLE.replace('kStop', 'kGetFrame')),
+
+    # 本轮新增：stop() 必须通知门口机停止推流（交接文档 1.3 条）。
+    # 这是**曾经真实缺失**的一条：修复前 stop() 只关本地 socket，从不发
+    # kStop，而门口机 CameraUdpServer 只在收到 Stop 时 sendTimer->stop()，
+    # 于是"监看中途退出程序"会让它按 20fps 永久空转推流。
+    ("stop() 不通知门口机（退出后门口机永久推流）",
+     SEND_STOP_IN_STOP,
+     '    if (m_active && m_socket) {\n'),
+
+    # 守卫被弱化：未处于接收态时也补发 stop（多余信令）。
+    # 这条是实测的**变异漏网**：原有用例全绿，因为"停过之后 socket 已被
+    # 销毁"，守卫里的 m_socket 恰好也为假。补了
+    # stopAfterToggleOffDoesNotResendStop（toggle 开→关、socket 仍在）才抓住。
+    ("stop() 失去 m_active 守卫（未接收也发 stop）",
+     '    if (m_active && m_socket) {',
+     '    if (m_socket) {'),
 
     # STOP_ACTIVE_BLOCK 必须恰好出现在 stop() 里一次（自证见 main）
     ("stop() 不清 m_active（停止后仍处于接收态）",

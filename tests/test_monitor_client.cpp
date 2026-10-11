@@ -663,6 +663,122 @@ private slots:
         QVERIFY(!client.isActive());
     }
 
+    /**
+     * @brief 已退出接收态但 socket 仍存活时，`stop()` 不得再补发 `stop`。
+     *
+     * 这条用例是为一个**变异漏网**补的：把 stop() 的守卫从
+     * `if (m_active && m_socket)` 弱化成 `if (m_socket)`，原有的全部用例
+     * 依旧全绿 —— 因为"停止过之后 socket 已经被销毁"，守卫里的 m_socket
+     * 恰好也为假，两种写法观察不到差别。
+     *
+     * 唯一能区分的情形是：**toggle 开→关**（socket 仍在、m_active 已为
+     * false）后再调 stop()。弱化版会多发一条多余的 `stop`；正确版不发。
+     * 多发虽然不至于破坏协议，但属于无意义信令，且会让"一条 getframe 对应
+     * 一条 stop"的配对关系失真，因此必须钉住。
+     */
+    void stopAfterToggleOffDoesNotResendStop()
+    {
+        if (!loopbackAliasAvailable()) {
+            QSKIP("本平台不支持 127.0.0.2 环回别名");
+        }
+        FakeTerminal fake;
+        QVERIFY(fake.bind());
+
+        MonitorClient client;
+        QVERIFY(client.toggle(QString::fromLatin1(kFakeTerminalIp)));   // getframe
+        QVERIFY(fake.waitForCount(1));
+        QVERIFY(!client.toggle(QString::fromLatin1(kFakeTerminalIp)));  // stop
+        QVERIFY(fake.waitForCount(2));
+        QCOMPARE(fake.at(1), QByteArrayLiteral("stop"));
+
+        // 此刻：socket 仍存活（从未 stop()），但已不在接收态。
+        QVERIFY(!client.isActive());
+        client.stop();
+        QTest::qWait(100);
+        fake.pump();
+        QCOMPARE(fake.count(), 2);   // 不应出现第三条
+    }
+
+    /**
+     * @brief 处于接收态时 `stop()` 必须真的把 `stop` 发给门口机。
+     *
+     * 为什么这条断言必须存在（一个真实缺陷，交接文档却写着"已修正"）
+     * ------------------------------------------------------------------
+     * 门口机侧 `CameraUdpServer` 只有收到 `stop` 才 `sendTimer->stop()`：
+     * 收到 `getframe` 后它以 50ms（20fps）的定时器持续推 JPEG，**关掉本地
+     * socket 对它完全不可观测**，它会一直往一个已经消失的地址推。
+     *
+     * 修复前 `MonitorClient::stop()` 只做两件事：关闭 socket、发
+     * `activeChanged(false)` —— **从不发 `stop`**。于是"用户在监看中途直接
+     * 关掉程序"这条路径（Widget 析构 → MonitorClient 析构 → stop()）会让
+     * 门口机的推流线程永久空转。
+     *
+     * 而原有的 31 个用例**全都抓不到**它：它们只断言端口释放、信号次数、
+     * 以及 toggle() 发出的字节；`stop()` 的发送侧从未被断言。这条用例补的
+     * 就是这个缺口 —— 也正是"有测试 ≠ 被测到"的一个实例。
+     *
+     * 断言三件事：
+     *   1. stop() 之后门口机确实多收到一条 `stop`（不是 `stopsend`！）；
+     *   2. 该报文是**裸文本、不带 '\n'**（与 getframe 同一约定）；
+     *   3. 重复 stop() 不会重复发送（幂等，避免多余信令）。
+     */
+    void stopWhenActiveNotifiesTerminal()
+    {
+        if (!loopbackAliasAvailable()) {
+            QSKIP("本平台不支持 127.0.0.2 环回别名");
+        }
+        FakeTerminal fake;
+        QVERIFY(fake.bind());
+
+        MonitorClient client;
+        QVERIFY(client.toggle(QString::fromLatin1(kFakeTerminalIp)));
+        QVERIFY(fake.waitForCount(1));
+        QCOMPARE(fake.at(0), QByteArrayLiteral("getframe"));
+
+        client.stop();
+
+        // 1 + 2：门口机收到裸 "stop"，且**不是**同前缀的 stopsend。
+        QVERIFY2(fake.waitForCount(2),
+                 "stop() 应当通知门口机停止推流；修复前这里只关本地 socket，"
+                 "门口机会继续以 20fps 推流（交接文档 1.3 条的约束）");
+        QCOMPARE(fake.at(1), QByteArrayLiteral("stop"));
+        QCOMPARE(fake.at(1).size(), 4);
+        QVERIFY(fake.at(1) != QByteArrayLiteral("stopsend"));
+
+        // 3：再停一次不应多发。
+        client.stop();
+        QTest::qWait(100);
+        fake.pump();
+        QCOMPARE(fake.count(), 2);
+    }
+
+    /**
+     * @brief 析构一个处于接收态的客户端，也必须通知门口机。
+     *
+     * 这是**用户实际退出路径**（关窗口 → Widget 析构 → 子对象 MonitorClient
+     * 析构）。上一条用例覆盖显式 stop()，本条覆盖析构这条捷径 —— 两者必须
+     * 都发 stop，否则"关程序"这个最常见的操作会漏掉通知。
+     */
+    void destructorOfActiveClientNotifiesTerminal()
+    {
+        if (!loopbackAliasAvailable()) {
+            QSKIP("本平台不支持 127.0.0.2 环回别名");
+        }
+        FakeTerminal fake;
+        QVERIFY(fake.bind());
+
+        {
+            MonitorClient client;
+            QVERIFY(client.toggle(QString::fromLatin1(kFakeTerminalIp)));
+            QVERIFY(fake.waitForCount(1));
+        }   // 析构
+
+        QVERIFY2(fake.waitForCount(2),
+                 "析构处于接收态的客户端时应当先发 stop 再关闭 socket；"
+                 "否则程序退出会让门口机推流线程永久空转");
+        QCOMPARE(fake.at(1), QByteArrayLiteral("stop"));
+    }
+
     void stopWithoutPriorBindIsSafe()
     {
         MonitorClient client;

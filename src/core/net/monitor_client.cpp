@@ -57,6 +57,28 @@ bool MonitorClient::start()
 
 void MonitorClient::stop()
 {
+    // 退出接收态前**先通知门口机**。
+    //
+    // 门口机侧（CameraUdpServer）只有在收到 `stop` 时才会
+    // `sendTimer->stop()`；仅仅关掉本地 socket 对它**不可观测** —— 它会继续
+    // 按 50ms（20fps）的定时器朝这个已经消失的地址推 JPEG，直到进程结束。
+    // 这正是《交接与继续开发》第 1.3 条要求的「发 stop 关掉远程监看」。
+    //
+    // 为什么必须放在这里、而不是只在按钮回调里：室内机退出时走的是
+    // Widget 析构 → MonitorClient（子对象）析构 → stop()。若 stop() 不发，
+    // 「用户在监看中途直接关掉程序」这条路径就会让门口机推流线程永久空转。
+    // 之前这里**恰恰没有发** —— 交接文档却写着"重构版已修正这一点"，
+    // 属于文档与实现不一致，由本注释与
+    // test_monitor_client.cpp 的 stopWhenActiveNotifiesTerminal 钉住。
+    //
+    // 只在**确实处于接收态**时发：没发过 getframe 就发 stop 是无意义的
+    // 多余信令。m_active 为 true 意味着 toggle() 已经成功绑定并记下地址。
+    if (m_active && m_socket) {
+        m_socket->writeDatagram(kStop, m_deviceAddress, protocol::kPreviewPort);
+        qDebug() << "[监看] 已发送 stop 到" << m_deviceAddress.toString()
+                 << "（通知门口机停止推流）";
+    }
+
     if (m_socket) {
         m_socket->close();
         m_socket->deleteLater();

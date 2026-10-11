@@ -3131,6 +3131,31 @@ def check_monitor_client_contract_is_pinned(root, src_root):
         fail("[monitor-client] monitor_client.cpp 应当用 protocol::kPreviewPort "
              "而不是硬编码端口号。")
 
+    # 4b) stop() 必须真的通知门口机。
+    #
+    #     这是一个**真实存在过的缺陷**：交接文档 1.3 条写着"~Widget() 必须发
+    #     stop 关掉远程监看……重构版已修正这一点"，但实现里 Widget 析构路径
+    #     （Widget 析构 → MonitorClient 析构 → stop()）**从来没发过 stop**。
+    #     门口机 CameraUdpServer 只在收到 stop 时 sendTimer->stop()，
+    #     关掉本地 socket 对它不可观测 —— 于是"监看中途退出程序"会让门口机
+    #     以 20fps 永久空转推流。
+    #
+    #     为什么行为测试不够、还要这条静态规则：本条的守卫是"stop() 里发了
+    #     kStop"，而 kStop 在 toggle() 里**也**出现。所以必须**限定在 stop()
+    #     的函数体内**再查 —— 只在整个文件里搜 `writeDatagram(kStop` 会被
+    #     toggle() 顶包（与 onVideoFrameReady 那条规则同一个坑，见 3140 行）。
+    stop_body = _brace_matched_body(text, "void MonitorClient::stop")
+    if stop_body is None:
+        fail("[monitor-client] 无法在 monitor_client.cpp 里定位 "
+             "MonitorClient::stop 的函数体（规则自身需要修复）。")
+    elif "writeDatagram(kStop" not in stop_body:
+        fail("[monitor-client] MonitorClient::stop() 必须在关闭 socket **之前**"
+             "把 kStop 发给门口机（交接文档 1.3 条）。只关本地 socket 的话，"
+             "门口机不可观测、会继续按 20fps 推流；用户『监看中途关掉程序』"
+             "这条路径（Widget 析构 → MonitorClient 析构 → stop()）会因此"
+             "让门口机推流线程永久空转。注意：本检查**限定在函数体内**，"
+             "只在整个文件里搜会被 toggle() 里的同名调用顶包。")
+
     # 5) 生产接线：Widget 里那道"非活动态不收帧"的门必须还在。
     #    它从 MonitorClient 搬到了 Widget::onVideoFrameReady（基线在
     #    onUdpDataReceived 里是 `if (!pix.isNull() && camActive)`）。
