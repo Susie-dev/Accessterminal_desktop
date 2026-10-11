@@ -37,6 +37,12 @@
   14. 按下鼠标不进入拖拽态
   15. 接听阈值被放大到不可能达到
 
+  ---- slidehintwidget.cpp（本目标也链接并覆盖了它）----
+  16. 流光控件不再忽略鼠标事件（接听滑块会拖不动）
+  17. 流光动画定时器不启动
+  18. 流光位置不再推进（动画卡死）
+  19. paintEvent 不再画流光
+
 对照（必须通过）
   C1. 只加无关注释
   C2. 改 qDebug 文案（不影响语义）
@@ -74,6 +80,9 @@ if len(sys.argv) > 1:
 _HERE = os.path.dirname(os.path.abspath(__file__))
 D = os.path.dirname(_HERE)
 SRC = os.path.join(D, 'src', 'ui', 'form_phonecall.cpp')
+# 本测试目标也链接并覆盖 `slidehintwidget.cpp`（流光引导控件），
+# 因此夹具要能对**两个**源文件做变异：变异条目可选第 4 个元素指定源文件。
+HINT_SRC = os.path.join(D, 'src', 'ui', 'slidehintwidget.cpp')
 
 CMAKE = shutil.which('cmake')
 BUILD = os.path.join(tempfile.gettempdir(), 'fi_form_phonecall')
@@ -141,6 +150,20 @@ MUT = [
     ("接听阈值被放大到不可能达到",
      'ui->widget_slider_area->width() - ui->label_slider->width() - 10;',
      'ui->widget_slider_area->width() - ui->label_slider->width() + 1000;'),
+
+    # ---- slidehintwidget.cpp（第 4 个元素指定另一份源文件）----
+    ("流光控件不再忽略鼠标事件（接听滑块会拖不动）",
+     '    setAttribute(Qt::WA_TransparentForMouseEvents, true); // 不拦截鼠标事件\n',
+     '', HINT_SRC),
+
+    ("流光动画定时器不启动",
+     '    timer->start(10);\n', '', HINT_SRC),
+
+    ("流光位置不再推进（动画卡死）",
+     '        pos += 5; // 速度加快\n', '', HINT_SRC),
+
+    ("paintEvent 不再画流光",
+     '    p.drawRoundedRect(lightRect, lightRadius, lightRadius);\n', '', HINT_SRC),
 ]
 
 CONTROL = [
@@ -167,11 +190,19 @@ UNDETECTABLE = [
 ]
 
 
-def read_src():
-    return io.open(SRC, encoding='utf-8', errors='replace').read()
+def read_src(path=None):
+    return io.open(path or SRC, encoding='utf-8', errors='replace').read()
 
 
-_ORIG = read_src()
+_ORIGS = {SRC: read_src(SRC), HINT_SRC: read_src(HINT_SRC)}
+# `_ORIG` / `SRC` 是"当前正在变异的那份文件"的原始内容与路径，循环里会重绑，
+# 这样下面的循环体可以原样使用 read_src() / _ORIG，不必逐处判断文件。
+_ORIG = _ORIGS[SRC]
+
+
+def item_src(item):
+    """变异条目可选第 4 个元素指定源文件；缺省是 form_phonecall.cpp。"""
+    return item[3] if len(item) > 3 else SRC
 
 
 # ---------------------------------------------------------------------------
@@ -180,18 +211,20 @@ _ORIG = read_src()
 # 工作区**。详见 tools/verify_monitor_client_test.py 里同一段说明。
 # ---------------------------------------------------------------------------
 def restore_src():
-    try:
-        current = read_src()
-    except Exception:
-        return
-    if current != _ORIG:
+    for path, orig in _ORIGS.items():
         try:
-            io.open(SRC, 'w', encoding='utf-8', newline='\n').write(_ORIG)
-            print('\n[崩溃安全] 已把 %s 还原为运行前的原始内容'
-                  % os.path.relpath(SRC, D))
-        except Exception as exc:
-            print('\n[崩溃安全][严重] 源码还原失败，工作区可能残留变异态: %r'
-                  % (exc,))
+            current = read_src(path)
+        except Exception:
+            continue
+        if current != orig:
+            try:
+                io.open(path, 'w', encoding='utf-8',
+                        newline='\n').write(orig)
+                print('\n[崩溃安全] 已把 %s 还原为运行前的原始内容'
+                      % os.path.relpath(path, D))
+            except Exception as exc:
+                print('\n[崩溃安全][严重] 源码还原失败，工作区可能残留变异态: %r'
+                      % (exc,))
 
 
 atexit.register(restore_src)
@@ -230,13 +263,16 @@ def totals(out):
 
 
 def main():
+    # 循环里会重绑这两个全局量（用来切换到不同源文件），必须显式声明。
+    global SRC, _ORIG
+
     if not CMAKE:
         print('找不到 cmake，无法运行自检')
         return 2
 
     for item in MUT + CONTROL + UNDETECTABLE:
         name, old = item[0], item[1]
-        n = _ORIG.count(old)
+        n = _ORIGS[item_src(item)].count(old)
         if n != 1:
             print('[夹具错误] %s 锚点出现 %d 次（必须恰好 1 次）' % (name, n))
             return 2
@@ -272,6 +308,9 @@ def main():
         print('--- 变异（每个都必须被抓到）---')
         for item in MUT:
             name, old, new = item[0], item[1], item[2]
+            # 切到该变异所属的源文件（缺省 form_phonecall.cpp）。
+            SRC = item_src(item)
+            _ORIG = _ORIGS[SRC]
             io.open(SRC, 'w', encoding='utf-8',
                     newline='\n').write(_ORIG.replace(old, new, 1))
             if read_src() == _ORIG:
@@ -311,6 +350,9 @@ def main():
         print('--- 对照（必须全绿，不能误报）---')
         for item in CONTROL:
             name, old, new = item[0], item[1], item[2]
+            # 切到该变异所属的源文件（缺省 form_phonecall.cpp）。
+            SRC = item_src(item)
+            _ORIG = _ORIGS[SRC]
             io.open(SRC, 'w', encoding='utf-8',
                     newline='\n').write(_ORIG.replace(old, new, 1))
             rb = build('desktop_test_form_phonecall')
@@ -335,6 +377,9 @@ def main():
         print('--- 已判定不可观测的退化（必须抓不到）---')
         for item in UNDETECTABLE:
             name, old, new = item[0], item[1], item[2]
+            # 切到该变异所属的源文件（缺省 form_phonecall.cpp）。
+            SRC = item_src(item)
+            _ORIG = _ORIGS[SRC]
             io.open(SRC, 'w', encoding='utf-8',
                     newline='\n').write(_ORIG.replace(old, new, 1))
             rb = build('desktop_test_form_phonecall')
@@ -356,9 +401,10 @@ def main():
             io.open(SRC, 'w', encoding='utf-8',
                     newline='\n').write(_ORIG)
     finally:
-        io.open(SRC, 'w', encoding='utf-8', newline='\n').write(_ORIG)
+        for _p, _o in _ORIGS.items():
+            io.open(_p, 'w', encoding='utf-8', newline='\n').write(_o)
 
-    same = read_src() == _ORIG
+    same = all(read_src(p) == o for p, o in _ORIGS.items())
     print()
     print('还原后重建并复核...')
     build('desktop_test_form_phonecall')
