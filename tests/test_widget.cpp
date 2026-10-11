@@ -77,6 +77,16 @@ const char* const kFakeDeviceIp = "127.0.0.2";
 /// 远程监看端口是协议常量，必须用真实的 50000。
 const quint16 kPreviewPort = accessterminal::protocol::kPreviewPort;
 
+/// 捕获 qWarning，用于断言"一条错误到底打印了几遍"。
+QStringList g_warnings;
+
+void captureWarnings(QtMsgType type, const QMessageLogContext&, const QString& msg)
+{
+    if (type == QtWarningMsg) {
+        g_warnings.append(msg);
+    }
+}
+
 /// 轮询等待（会跑事件循环，跨线程/信号都在同一线程内投递）。
 template <typename Predicate>
 bool waitFor(Predicate pred, int timeoutMs = 3000)
@@ -193,6 +203,9 @@ private slots:
 
     // ---- 配置隔离自证 ----
     void configIsolationIsActuallyInEffect();
+
+    // ---- 日志：一条错误只能打印一次 ----
+    void moduleErrorIsLoggedExactlyOnce();
 
     // ---- 界面开关 ----
     void powerButtonTogglesScreenOffStyle();
@@ -350,6 +363,54 @@ void TestWidget::configIsolationIsActuallyInEffect()
              static_cast<int>(port));
     QVERIFY2(AppConfig::instance().weatherUrl().isEmpty(),
              "天气 URL 必须为空，否则测试会真的去请求外网");
+}
+
+// ===========================================================================
+// 日志：一条错误只能打印一次
+// ===========================================================================
+
+/**
+ * 真实现象（**跑起来才看见的**）：启动时串口打不开，日志里"串口打开失败"
+ * 出现**两遍** —— `SerialLight` 自己 `qWarning` 之后 `emit errorOccurred`，
+ * 而 `Widget` 又连了 `errorOccurred` 再 `qWarning` 一遍。信令、监看、天气
+ * 都是同一个写法；天气更特别：它有两处只 `emit` 不 `log`，靠 Widget 兜底，
+ * 于是同一个天气错误**时而两遍、时而一遍**，现场看不出规律。
+ *
+ * 害处不是"多几行日志"：一次故障看起来像两次，排障会误判成反复失败；
+ * 而不一致更会让人怀疑"是不是有两处不同的问题"。
+ *
+ * 现约定：**错误日志由发出它的模块自己负责，UI 侧不再重复打印**。
+ * 这条用例用替身串口强制"打开失败"，数一数这条消息打印了几遍。
+ * `QCOMPARE(hits, 1)` 同时挡住两个方向：重复打印(2) 和 干脆不打印(0)。
+ */
+void TestWidget::moduleErrorIsLoggedExactlyOnce()
+{
+    QVERIFY(!loadIsolatedConfig(pickFreePort()).isEmpty());
+
+    // 让替身串口打开失败 —— 等价于现场没有 /dev/ttyUSB0。
+    resetFakeSerialPort();
+    fakeSerialPort().failOpen = true;
+    fakeSerialPort().errorString = QStringLiteral("(测试注入的打不开)");
+
+    g_warnings.clear();
+    QtMessageHandler prev = qInstallMessageHandler(captureWarnings);
+    QScopedPointer<Widget> w(makeWidget());
+    qInstallMessageHandler(prev);
+
+    int hits = 0;
+    QString hitText;
+    for (const QString& line : g_warnings) {
+        if (line.contains(QStringLiteral("串口打开失败"))) {
+            ++hits;
+            hitText = line;
+        }
+    }
+    QVERIFY2(hits == 1,
+             qPrintable(QStringLiteral("『串口打开失败』应当只打印 1 遍，实际 %1 遍")
+                            .arg(hits)));
+    // 且那一条必须是模块自己打的**完整**消息（不是靠"干脆不打"蒙混过关）。
+    QVERIFY2(hitText.contains(QStringLiteral("ACC_TEST_FAKE_PORT")),
+             qPrintable(QStringLiteral("日志应包含串口名，实际: ") + hitText));
 }
 
 // ===========================================================================

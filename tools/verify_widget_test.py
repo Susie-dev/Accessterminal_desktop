@@ -39,6 +39,7 @@ widget.cpp 不含协议编解码，但它决定了三件直接影响互操作的
   16. 日期格式改掉（用户看到的日期变了）
   17. on_btngetframe_clicked 忽略 toggle 结果（状态机与 UI 不同步）
   18. handleCall 不再 show() 浮层（弹窗不出现）
+  19. 又给灯控 errorOccurred 接一遍重复日志（一次故障打印两遍）
 
 对照（必须通过）
   C1. 只加无关注释
@@ -187,6 +188,16 @@ MUT = [
     ("handleCall 不再 show() 浮层",
      '    m_callForm->show();\n',
      ''),
+
+    # 真实现象：启动时"串口打开失败"在日志里出现两遍 —— SerialLight 自己
+    # qWarning 后 emit，Widget 又连 errorOccurred 再 qWarning 一遍。
+    # 这条变异把那个重复日志加回去，必须被 moduleErrorIsLoggedExactlyOnce 抓到。
+    ("灯控错误又被 Widget 重复 log 一遍（一次故障两行）",
+     '    // errorOccurred 不在这里重复 log，理由同 SignalingServer。\n'
+     '    m_light->open(cfg.serialPortName());\n',
+     '    connect(m_light, &SerialLight::errorOccurred, this,\n'
+     '            [](const QString& msg) { qWarning() << "[灯控]" << msg; });\n'
+     '    m_light->open(cfg.serialPortName());\n'),
 ]
 
 CONTROL = [

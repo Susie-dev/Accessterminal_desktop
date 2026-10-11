@@ -124,7 +124,14 @@ void WeatherService::onFinished()
 
     const QJsonDocument doc = QJsonDocument::fromJson(reply->readAll());
     if (!doc.isObject()) {
-        emit errorOccurred(QStringLiteral("天气响应不是 JSON 对象"));
+        // 约定：**错误日志由发出它的模块自己负责**。本文件里每一处
+        // `emit errorOccurred` 都先 log 一遍，UI 侧不再重复打印。
+        // 此前这两处只 emit 不 log，靠 Widget 兜底 —— 于是同一个天气错误
+        // 时而打印两遍（走上面的分支）、时而一遍（走这里），
+        // 现场看不出规律。补齐后全类一致。
+        const QString msg = QStringLiteral("天气响应不是 JSON 对象");
+        qWarning() << "[天气]" << msg;
+        emit errorOccurred(msg);
         return;
     }
     const QJsonObject root = doc.object();
@@ -136,7 +143,9 @@ void WeatherService::onFinished()
     const QJsonArray forecast = root.value(QStringLiteral("data")).toObject()
                                     .value(QStringLiteral("forecast")).toArray();
     if (forecast.isEmpty()) {
-        emit errorOccurred(QStringLiteral("天气数据缺少预报内容"));
+        const QString msg = QStringLiteral("天气数据缺少预报内容");
+        qWarning() << "[天气]" << msg;
+        emit errorOccurred(msg);
         return;
     }
     const QJsonObject today = forecast.at(0).toObject();

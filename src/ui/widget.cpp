@@ -94,8 +94,14 @@ void Widget::setupModules()
             this, &Widget::onSignalReceived);
     connect(m_signaling, &SignalingServer::clientConnected, this,
             [](const QString& peer) { qInfo() << "[信令] 在线门口机:" << peer; });
-    connect(m_signaling, &SignalingServer::errorOccurred, this,
-            [](const QString& msg) { qWarning() << "[信令]" << msg; });
+    // 刻意**不**在这里再连一次 errorOccurred：SignalingServer 自己已经
+    // log 过同一条消息（先 qWarning 再 emit），这里再打一遍会让一次故障在
+    // 日志里看起来像两次 —— 实测启动时"串口打开失败"就是这样成对出现，
+    // 现场会把一次失败误读成反复失败，而且天气那条时而又只有一遍。
+    //
+    // 约定：**错误日志由发出它的模块自己负责，全工程只此一处**。
+    // 模块已经 emit errorOccurred 供 UI 将来做提示（弹窗/状态灯）用，
+    // 但那不该是"再 log 一遍"。
 
     if (!m_signaling->listen(cfg.signalingPort())) {
         qWarning() << "[信令] 监听失败，通话功能不可用";
@@ -107,13 +113,11 @@ void Widget::setupModules()
     m_monitor = new MonitorClient(this);
     connect(m_monitor, &MonitorClient::frameReceived,
             this, &Widget::onVideoFrameReady);
-    connect(m_monitor, &MonitorClient::errorOccurred, this,
-            [](const QString& msg) { qWarning() << "[监看]" << msg; });
+    // errorOccurred 不在这里重复 log，理由同 SignalingServer。
 
     // ---- 灯控串口 ----
     m_light = new SerialLight(this);
-    connect(m_light, &SerialLight::errorOccurred, this,
-            [](const QString& msg) { qWarning() << "[灯控]" << msg; });
+    // errorOccurred 不在这里重复 log，理由同 SignalingServer。
     m_light->open(cfg.serialPortName());
 
     // ---- 天气 ----
@@ -124,8 +128,7 @@ void Widget::setupModules()
                     ui->label_weather->setText(text);
                 }
             });
-    connect(m_weather, &WeatherService::errorOccurred, this,
-            [](const QString& msg) { qWarning() << "[天气]" << msg; });
+    // errorOccurred 不在这里重复 log，理由同 SignalingServer。
     m_weather->refresh();
 }
 
