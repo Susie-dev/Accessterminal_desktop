@@ -1,0 +1,110 @@
+/**
+ * @file QAudioFormat
+ * @brief **测试专用**的 QAudioFormat 替身（影子头文件）。
+ *
+ * 与 tests/fake_serial_port/QSerialPort 同一套做法：命名为真头的名字、
+ * 用 target_include_directories(BEFORE ...) 插到 Qt 的 include 之前。
+ *
+ * `bytesPerFrame()` 必须与真 Qt 语义**逐位一致**：`startAudioOutput()` 用
+ * `bytesPerMs = bytesPerFrame() * sampleRate / 1000` 算缓冲区大小，那是被测
+ * 代码的行为，不能被替身改掉。真 Qt 的算法是
+ *     bytesPerFrame = (sampleSize / 8) * channelCount
+ * 且任一参数未设置时返回 0（这里同样返回 0）。
+ *
+ * 记录方式：QAudioFormat 自己**分不清**它是给输入还是给输出用的（被测代码
+ * 用同一个 `pcmFormat()` 造两份）。所以这里把每次 setter 记进
+ * `fakeAudio().lastFormat`，再由 QAudioInput / QAudioOutput 的构造函数
+ * **快照**成 inFormat / outFormat。于是断言既有"最终生效的格式"，
+ * 也有"setter 各被调了几次"。
+ */
+#ifndef ACCESSTERMINAL_TESTS_FAKE_QAUDIOFORMAT_H
+#define ACCESSTERMINAL_TESTS_FAKE_QAUDIOFORMAT_H
+
+#ifndef ACC_CALL_SESSION_TEST
+#  error "影子 QtMultimedia 头只能用于测试；请在测试目标上定义 ACC_CALL_SESSION_TEST"
+#endif
+
+#include <QString>
+
+#include "fake_audio.h"
+
+class QAudioFormat
+{
+public:
+    enum SampleType { Unknown = 0, SignedInt, UnSignedInt, Float };
+    enum Endian { BigEndian = 0, LittleEndian = 1 };
+
+    QAudioFormat()
+    {
+        // 每次构造清空"最近一次格式"，避免上一份残留被误当成当前值。
+        fakeAudio().lastFormat = FakeAudioFormatRecord();
+    }
+
+    bool isValid() const
+    {
+        return m_sampleRate > 0 && m_channelCount > 0 && m_sampleSize > 0;
+    }
+
+    void setSampleRate(int rate)
+    {
+        m_sampleRate = rate;
+        fakeAudio().lastFormat.sampleRate = rate;
+        ++fakeAudio().lastFormat.setSampleRateCalls;
+    }
+    void setChannelCount(int n)
+    {
+        m_channelCount = n;
+        fakeAudio().lastFormat.channelCount = n;
+        ++fakeAudio().lastFormat.setChannelCountCalls;
+    }
+    void setSampleSize(int bits)
+    {
+        m_sampleSize = bits;
+        fakeAudio().lastFormat.sampleSize = bits;
+        ++fakeAudio().lastFormat.setSampleSizeCalls;
+    }
+    void setCodec(const QString& c)
+    {
+        m_codec = c;
+        fakeAudio().lastFormat.codec = c;
+        ++fakeAudio().lastFormat.setCodecCalls;
+    }
+    void setByteOrder(Endian e)
+    {
+        m_byteOrder = static_cast<int>(e);
+        fakeAudio().lastFormat.byteOrder = static_cast<int>(e);
+        ++fakeAudio().lastFormat.setByteOrderCalls;
+    }
+    void setSampleType(SampleType t)
+    {
+        m_sampleType = static_cast<int>(t);
+        fakeAudio().lastFormat.sampleType = static_cast<int>(t);
+        ++fakeAudio().lastFormat.setSampleTypeCalls;
+    }
+
+    int sampleRate() const { return m_sampleRate; }
+    int channelCount() const { return m_channelCount; }
+    int sampleSize() const { return m_sampleSize; }
+    QString codec() const { return m_codec; }
+    Endian byteOrder() const { return static_cast<Endian>(m_byteOrder); }
+    SampleType sampleType() const { return static_cast<SampleType>(m_sampleType); }
+
+    /// 与真 Qt 同式；任一参数未设置则为 0。
+    int bytesPerFrame() const
+    {
+        if (m_sampleRate <= 0 || m_channelCount <= 0 || m_sampleSize <= 0) {
+            return 0;
+        }
+        return (m_sampleSize / 8) * m_channelCount;
+    }
+
+private:
+    int m_sampleRate = -1;
+    int m_channelCount = -1;
+    int m_sampleSize = -1;
+    QString m_codec;
+    int m_byteOrder = -1;
+    int m_sampleType = -1;
+};
+
+#endif // ACCESSTERMINAL_TESTS_FAKE_QAUDIOFORMAT_H

@@ -1,0 +1,93 @@
+/**
+ * @file QAudioOutput
+ * @brief **测试专用**的 QAudioOutput 替身（影子头文件）。
+ *
+ * 只实现 `call_session.cpp` 用到的 API。构造函数把当前 QAudioFormat
+ * **快照**下来，这样测试能断言"送给声卡的格式到底是 16k/单声道/S16"。
+ *
+ * 刻意**不加 Q_OBJECT**：本头不在任何目标的源列表里，AUTOMOC 不处理。
+ * 父对象机制由 QObject 基类提供。
+ */
+#ifndef ACCESSTERMINAL_TESTS_FAKE_QAUDIOOUTPUT_H
+#define ACCESSTERMINAL_TESTS_FAKE_QAUDIOOUTPUT_H
+
+#ifndef ACC_CALL_SESSION_TEST
+#  error "影子 QtMultimedia 头只能用于测试；请在测试目标上定义 ACC_CALL_SESSION_TEST"
+#endif
+
+#include <QAudioFormat>
+#include <QObject>
+#include <QString>
+
+#include "fake_audio.h"
+
+class QAudioOutput : public QObject
+{
+public:
+    // call_session.cpp 只用到了 error() 的**返回值**（int 比较/输出），
+    // 因此这里给出与真 Qt 同名的枚举，取值与 Qt5 的 QAudio::Error 一致。
+    enum Error { NoError = 0, OpenError, IOError, UnderrunError, FatalError };
+
+    explicit QAudioOutput(const QAudioFormat& format, QObject* parent = nullptr)
+        : QObject(parent), m_format(format)
+    {
+        FakeAudioRecord& r = fakeAudio();
+        ++r.outCtorCalls;
+        // 快照：这一刻的格式就是后续真正生效的格式。
+        r.outFormat = r.lastFormat;
+        r.outBytesPerFrame = format.bytesPerFrame();
+        if (!r.outDevice) {
+            r.outDevice = new FakeAudioDevice(this);
+        }
+    }
+
+    ~QAudioOutput() override
+    {
+        if (fakeAudio().outDevice) {
+            fakeAudio().outDevice = nullptr;
+        }
+    }
+
+    void setBufferSize(int bytes) { fakeAudio().outBufferSize = bytes; }
+    int bufferSize() const { return fakeAudio().outBufferSize; }
+
+    void setNotifyInterval(int ms) { fakeAudio().outNotifyInterval = ms; }
+    int notifyInterval() const { return fakeAudio().outNotifyInterval; }
+
+    /// 真 Qt 在缓冲区写入进度上返回剩余空闲字节数；替身由测试设定。
+    int bytesFree() const { return fakeAudio().bytesFree; }
+
+    int error() const { return fakeAudio().outError; }
+    QString errorString() const { return QStringLiteral("fake-audio-output"); }
+
+    QIODevice* start()
+    {
+        FakeAudioRecord& r = fakeAudio();
+        ++r.outStartCalls;
+        if (r.failOutputStart || !r.outDevice) {
+            return nullptr;
+        }
+        r.outDevice->open(QIODevice::WriteOnly);
+        return r.outDevice;
+    }
+
+    void stop()
+    {
+        FakeAudioRecord& r = fakeAudio();
+        ++r.outStopCalls;
+        if (r.outDevice) {
+            r.outDevice->close();
+        }
+    }
+
+    void reset() {}
+    void suspend() {}
+    void resume() {}
+
+    const QAudioFormat& format() const { return m_format; }
+
+private:
+    QAudioFormat m_format;
+};
+
+#endif // ACCESSTERMINAL_TESTS_FAKE_QAUDIOOUTPUT_H

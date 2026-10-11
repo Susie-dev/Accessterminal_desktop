@@ -250,3 +250,57 @@ target_link_libraries(desktop_test_serial_light PRIVATE
 )
 
 add_test(NAME desktop_serial_light COMMAND desktop_test_serial_light)
+
+# ---------------------------------------------------------------------------
+# CallSession：室内机通话（UDP 12345 双向音频 + UDP 23456 单向视频）
+#
+# `src/core/media/call_session.cpp` 此前**从未被任何测试目标链接**，却是两条
+# 协议硬约束的室内机一侧：
+#   - UDP 12345 双向音频，裸 PCM（S16_LE/16000Hz/单声道），无包头，
+#     每包 320 帧 / 640 字节；
+#   - UDP 23456 单向视频，门口机→室内机，每包一帧**完整 JPEG**，不重组不重传。
+# 门口机那侧有测试、室内机这侧没有 —— 于是门口机改了字节，这边仍然绿，
+# 而互操作已经断了。
+#
+# **socket 一律用真的**：端口是协议常量，不能像 monitor_client 那样挪到别的
+# 端口测。探针实测（%TEMP%\probe34\result17.txt）确认本机可以
+# bind(AnyIPv4,12345,ShareAddress)，且收到的 sender=127.0.0.2:52803 与发送端
+# 一致，因此在**真实协议端口**上收发，才真正证明"端口对了、报文语义对了"。
+# 绑定失败也可靠造出（result18.txt：先独占绑占住端口，3/3 次稳定复现）。
+#
+# **只有声卡是替身**：本机虽有可用音频设备（result16.txt），但把单元测试绑在
+# 开发机的真实声卡上会让结果取决于机器（有无声卡、是否被独占）——
+# 那正是"在我这儿能跑"的坑。替身让音频路径完全确定。
+#
+# 影子头机制同 desktop_test_serial_light：把替身命名为 QAudioFormat /
+# QAudioInput / QAudioOutput 放在 tests/fake_audio/，用 BEFORE 插到 Qt 的
+# include 之前。因为三个音频类全被替换，本目标**不需要** Qt5::Multimedia。
+# 安全阀：影子头要求显式定义 ACC_CALL_SESSION_TEST，否则 #error。
+# ---------------------------------------------------------------------------
+add_executable(desktop_test_call_session
+    test_call_session.cpp
+    fake_audio.cpp
+    ${ACCESSTERMINAL_SRC_ROOT}/core/media/call_session.cpp
+)
+
+target_include_directories(desktop_test_call_session BEFORE PRIVATE
+    ${CMAKE_CURRENT_LIST_DIR}/fake_audio
+)
+
+target_include_directories(desktop_test_call_session PRIVATE
+    ${ACCESSTERMINAL_SRC_ROOT}
+    ${CMAKE_CURRENT_LIST_DIR}
+)
+
+target_compile_definitions(desktop_test_call_session PRIVATE
+    ACC_CALL_SESSION_TEST
+)
+
+target_link_libraries(desktop_test_call_session PRIVATE
+    Qt5::Core
+    Qt5::Test
+    Qt5::Network
+    Qt5::Gui
+)
+
+add_test(NAME desktop_call_session COMMAND desktop_test_call_session)

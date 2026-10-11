@@ -1,0 +1,84 @@
+/**
+ * @file QAudioInput
+ * @brief **测试专用**的 QAudioInput 替身（影子头文件）。
+ *
+ * 与 QAudioOutput 对称：构造时快照 QAudioFormat，`start()` 返回可投喂的
+ * 替身设备，测试用 `FakeAudioDevice::feedBytes()` 模拟声卡送来上行语音。
+ */
+#ifndef ACCESSTERMINAL_TESTS_FAKE_QAUDIOINPUT_H
+#define ACCESSTERMINAL_TESTS_FAKE_QAUDIOINPUT_H
+
+#ifndef ACC_CALL_SESSION_TEST
+#  error "影子 QtMultimedia 头只能用于测试；请在测试目标上定义 ACC_CALL_SESSION_TEST"
+#endif
+
+#include <QAudioFormat>
+#include <QObject>
+#include <QString>
+
+#include "fake_audio.h"
+
+class QAudioInput : public QObject
+{
+public:
+    enum Error { NoError = 0, OpenError, IOError, UnderrunError, FatalError };
+
+    explicit QAudioInput(const QAudioFormat& format, QObject* parent = nullptr)
+        : QObject(parent), m_format(format)
+    {
+        FakeAudioRecord& r = fakeAudio();
+        ++r.inCtorCalls;
+        r.inFormat = r.lastFormat;
+        r.inBytesPerFrame = format.bytesPerFrame();
+        if (!r.inDevice) {
+            r.inDevice = new FakeAudioDevice(this);
+        }
+    }
+
+    ~QAudioInput() override
+    {
+        if (fakeAudio().inDevice) {
+            fakeAudio().inDevice = nullptr;
+        }
+    }
+
+    void setBufferSize(int bytes) { fakeAudio().inBufferSize = bytes; }
+    int bufferSize() const { return fakeAudio().inBufferSize; }
+
+    void setNotifyInterval(int ms) { fakeAudio().inNotifyInterval = ms; }
+    int notifyInterval() const { return fakeAudio().inNotifyInterval; }
+
+    int error() const { return fakeAudio().inError; }
+    QString errorString() const { return QStringLiteral("fake-audio-input"); }
+
+    QIODevice* start()
+    {
+        FakeAudioRecord& r = fakeAudio();
+        ++r.inStartCalls;
+        if (r.failInputStart || !r.inDevice) {
+            return nullptr;
+        }
+        r.inDevice->open(QIODevice::ReadOnly);
+        return r.inDevice;
+    }
+
+    void stop()
+    {
+        FakeAudioRecord& r = fakeAudio();
+        ++r.inStopCalls;
+        if (r.inDevice) {
+            r.inDevice->close();
+        }
+    }
+
+    void reset() {}
+    void suspend() {}
+    void resume() {}
+
+    const QAudioFormat& format() const { return m_format; }
+
+private:
+    QAudioFormat m_format;
+};
+
+#endif // ACCESSTERMINAL_TESTS_FAKE_QAUDIOINPUT_H

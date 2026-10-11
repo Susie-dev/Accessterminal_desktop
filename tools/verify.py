@@ -3396,11 +3396,224 @@ def check_serial_light_contract_is_pinned(root, src_root):
                 fail("[serial] tests/CMakeLists.txt 没有真正定义 "
                      "ACC_SERIAL_LIGHT_TEST（注释里提过不算），影子头的安全阀"
                      "会直接 #error，测试根本编译不过。")
-            if not re.search(
-                    r"target_include_directories\s*\(\s*\w+\s+BEFORE\b", cm):
-                fail("[serial] tests/CMakeLists.txt 的 target_include_directories "
-                     "必须带 BEFORE：否则影子头目录排在 Qt 的 include 之后，"
-                     "`#include <QSerialPort>` 仍会命中真 Qt 头。")
+            # BEFORE 检查必须**限定在引用 fake_serial_port 的那次调用**里。
+            # 用一条能匹配任意目标的宽松正则会造成假绿：第 34 轮新增的
+            # desktop_test_call_session 也带 BEFORE，于是把 serial_light 的
+            # BEFORE 删掉后正则仍命中，规则静默失效（故障注入当场抓到）。
+            shim_call = _cmake_call_containing(
+                cm, "target_include_directories", "fake_serial_port")
+            if shim_call is None:
+                fail("[serial] 在 tests/CMakeLists.txt 里找不到引用 "
+                     "fake_serial_port 的 target_include_directories 调用"
+                     "（规则自身需要修复）。")
+            elif not re.search(r"^\s*\w+\s+BEFORE\b",
+                               shim_call.split("(", 1)[1]):
+                fail("[serial] 引用 fake_serial_port 的那次 "
+                     "target_include_directories 必须带 BEFORE：否则影子头目录"
+                     "排在 Qt 的 include 之后，`#include <QSerialPort>` 仍会"
+                     "命中真 Qt 头。注意这里必须只看**这一次**调用 —— 别处"
+                     "（别的测试目标）带 BEFORE 不能算数。")
+
+
+def _cmake_call_containing(text, command, marker):
+    """返回 CMake 里**包含 marker** 的那个 `<command>(...)` 调用的完整原文。
+
+    为什么要这个而不是一条正则：第 34 轮加 `desktop_test_call_session` 时，
+    影子头的 `BEFORE` 检查立刻**变成了假绿** —— 原来的正则
+    `target_include_directories\\s*\\(\\s*\\w+\\s+BEFORE\\b` 会匹配**任意**
+    带 BEFORE 的目标，于是把 serial_light 那个 BEFORE 删掉后，新目标的
+    BEFORE 仍然让正则命中，规则静默失效。
+
+    正确做法是"先把**包含该影子头目录**的那次调用框出来，再在这个调用内部
+    检查 BEFORE"。括号按深度配对（CMake 的调用里可以嵌套括号）。
+    找不到就返回 None，让调用方报"规则自身需修复"而不是假通过。
+    """
+    for m in re.finditer(re.escape(command) + r"\s*\(", text):
+        i = m.end() - 1  # 指向 '('
+        depth = 0
+        for j in range(i, len(text)):
+            if text[j] == "(":
+                depth += 1
+            elif text[j] == ")":
+                depth -= 1
+                if depth == 0:
+                    call = text[m.start():j + 1]
+                    if marker in call:
+                        return call
+                    break
+    return None
+
+
+def check_call_session_contract_is_pinned(root, src_root):
+    r"""
+    通话会话里有几处**行为测试抓不到**（或抓不到全部）的契约，靠静态规则钉住。
+
+    `src/core/media/call_session.cpp` 第 34 轮才首次进测试
+    （`desktop_test_call_session`，33 个用例，socket 用真的、只替声卡）。
+    故障注入 22 个变异全部被抓到，但有 5 个**实测无判别力**，如实记录后
+    改由本规则守（而不是留在测试里假装守着）：
+
+      1. UDP 两个口的 `ShareAddress`。实测（探针 result20.txt A 组）本机
+         Windows 上无论带不带共享标志，第二个绑同一端口的 socket 都失败
+         （A1/A2/A3 三组对照全部 "true / false"）——**能不能重复绑取决于本机
+         socket 语义，与共享标志无关**，因此测试测不出差别。
+         但这两个标志是刻意写的（Linux 上 SO_REUSEADDR 允许重复绑），
+         不能被"顺手删掉"。
+
+      2. 音频/视频 `readDatagram` 的返回值判断与缩容。实测 B 组：对
+         0/1/4/100/640/678/1400/65507 共 8 种长度，返回值**恒等于**
+         pendingDatagramSize()，UDP 上不会短读。与第 31/32 轮在
+         monitor_client 上量到的结论一致。这段防御代码仍值得留着
+         （防 Qt 实现变化与平台差异），但测试无法证明它有效。
+
+      3. 上行语音的"未学到地址不发"守卫。实测（result19.txt）：地址为空时
+         **Qt 自己就拒绝发送**（writeDatagram 返回 -1，对端收不到），
+         所以那道 `if` 与 Qt 内部校验重叠。
+
+    另外钉住**协议硬约束**本身（这些其实测试也覆盖了，但按文本再守一道，
+    便宜且能挡住"改了源码但测试被一起改宽"的情形）。
+    """
+    cs = os.path.join(src_root, "core", "media", "call_session.cpp")
+    if not os.path.exists(cs):
+        return  # 本仓库没有该模块，规则安全通过
+    text = io.open(cs, encoding="utf-8", errors="replace").read()
+
+    # ---- 协议硬约束：两个端口与共享标志（1 的部分）----
+    for needle, why in (
+            ('bind(QHostAddress::AnyIPv4, protocol::kAudioPort,\n'
+             '                             QUdpSocket::ShareAddress)',
+             "音频口必须绑 0.0.0.0(kAudioPort=12345) 且带 ShareAddress"),
+            ('bind(QHostAddress::Any, protocol::kVideoPort,\n'
+             '                             QUdpSocket::ShareAddress)',
+             "视频口必须绑 Any(kVideoPort=23456) 且带 ShareAddress"),
+    ):
+        if needle not in text:
+            fail("[call] call_session.cpp 缺少预期绑定：%s。" % why)
+
+    # ---- 音频格式：S16_LE / 16k / 单声道（裸 PCM 的具体取值）----
+    # 这几个测试**能**覆盖（改坏了会红），但格式错一位上下行就全废，
+    # 按文本再钉一道几乎没有成本。
+    for needle, why in (
+            ('format.setSampleRate(protocol::kAudioSampleRate)',
+             "采样率必须是 kAudioSampleRate(16000)"),
+            ('format.setChannelCount(protocol::kAudioChannels)',
+             "声道数必须是 kAudioChannels(1)"),
+            ('format.setSampleSize(protocol::kAudioBytesPerSample * 8)',
+             "位深必须是 kAudioBytesPerSample*8（即 16 位）"),
+            ('format.setByteOrder(QAudioFormat::LittleEndian)',
+             "字节序必须是 LittleEndian（门口机发的是 S16_LE）"),
+            ('format.setSampleType(QAudioFormat::SignedInt)',
+             "采样类型必须是 SignedInt"),
+    ):
+        if needle not in text:
+            fail("[call] call_session.cpp 的音频格式缺少预期：%s。" % why)
+
+    # ---- 2) readDatagram 返回值判断 + 缩容，必须留在两个接收路径里 ----
+    # 测试抓不到（见函数文档），只能静态守。
+    for marker, label in (
+            ('void CallSession::onAudioDataReady()', "音频接收"),
+            ('void CallSession::onVideoDataReady()', "视频接收"),
+    ):
+        body = _brace_matched_body_with_strings(text, marker)
+        if body is None:
+            fail("[call] 无法在 call_session.cpp 里定位 %s 的函数体"
+                 "（规则自身需要修复）。" % marker)
+            continue
+        if 'if (bytesRead < 0)' not in body:
+            fail("[call] %s 里必须判 `readDatagram` 的返回值 < 0 并丢弃该包："
+                 "QByteArray::resize() 不会清零新分配的字节，失败时尾部是"
+                 "未初始化内存。**实测本机抓不到**（result20.txt B 组：返回值"
+                 "恒等于 pendingDatagramSize），所以只能靠这条规则守住。" % label)
+        if 'datagram.resize(static_cast<int>(bytesRead))' not in body:
+            fail("[call] %s 里必须在短读时把 datagram 缩容到实际字节数，"
+                 "否则尾部残留会喂给声卡/解码器（实测本机抓不到，"
+                 "理由同上）。" % label)
+
+    # ---- 3) 上行语音的地址守卫 ----
+    body = _brace_matched_body_with_strings(text, 'void CallSession::onInputReady()')
+    if body is None:
+        fail("[call] 无法在 call_session.cpp 里定位 onInputReady() 的函数体"
+             "（规则自身需要修复）。")
+    elif 'm_deviceAddress.isNull()' not in body:
+        fail("[call] onInputReady() 必须在发送前判断已学到回传地址"
+             "（`!m_deviceAddress.isNull()`）：实测 Qt 自身也会拒绝空地址"
+             "（result19.txt：writeDatagram 返回 -1），因此**单元测试抓不到**，"
+             "只能靠这条规则守住意图。")
+
+    # ---- 4) stop() 必须清空全部四个成员指针 ----
+    #
+    # 这一条守的是一个**覆盖率数字背后的真实不变量**。
+    #
+    # `startAudioSocket()` / `startAudioOutput()` / `startAudioInput()` 开头都有
+    # "已经建过就早返回/先拆掉"的幂等守卫（第 71、94、119-121、138-140 行）。
+    # 覆盖率报告把它们算进「可达未测」（共 9 行），因为它们的**所在函数有
+    # 调用者**——按工具的定义没错。但它们其实是**不可达**的，原因正是
+    # `stop()` 无条件把四个指针全部置空，而 `start()` 在 running 时必定先
+    # `stop()`、不 running 时指针本来也是空（构造不建任何东西）。
+    #
+    # 于是"那 9 行不可达"这个结论**依赖 stop() 清空指针这个不变量**。
+    # 一旦有人从 stop() 里删掉某一行，守卫立刻变成真实可达的代码路径
+    # （而且很可能是个真 bug：残留的 socket 会带着旧连接进入新通话）。
+    # 与其把这 9 行当成"待办"供着，不如把**它们不可达的前提**钉住 ——
+    # 前提破了，规则就响。
+    stop_body = _brace_matched_body_with_strings(text, 'void CallSession::stop()')
+    if stop_body is None:
+        fail("[call] 无法在 call_session.cpp 里定位 stop() 的函数体"
+             "（规则自身需要修复）。")
+    else:
+        for member in ('m_audioSocket', 'm_videoSocket',
+                       'm_audioOutput', 'm_audioInput'):
+            # 必须是 `member = nullptr;` 这种**无条件**置空。
+            pat = re.compile(r'^\s*' + re.escape(member) + r'\s*=\s*nullptr\s*;',
+                             re.M)
+            if not pat.search(stop_body):
+                fail("[call] stop() 必须无条件把 %s 置空。三个 start*() 开头的"
+                     "幂等守卫（已建过就早返回 / 先拆旧的）之所以**不可达**，"
+                     "唯一前提就是 stop() 清空了这些指针；删掉这一行，那些"
+                     "守卫立刻变成真实可达路径（残留的 socket 会带进新通话）。"
+                     "覆盖率把这些行算作『可达未测』，本规则守住其真正前提。"
+                     % member)
+
+    # ---- 5) 影子头的注入方式：BEFORE + ACC_CALL_SESSION_TEST ----
+    # 与 serial_light 同款风险：BEFORE 一旦丢掉，`#include <QAudioFormat>` 会
+    # 命中真 Qt 头（测试仍然编译通过，只是在测**真声卡** —— 机器间结果不一致，
+    # 正是要消灭的"在我这儿能跑"）。
+    tests_cmake = os.path.join(root, "tests", "CMakeLists.txt")
+    if os.path.exists(tests_cmake):
+        cm_raw = io.open(tests_cmake, encoding="utf-8",
+                         errors="replace").read()
+        cm = "\n".join(l for l in cm_raw.split("\n")
+                       if not l.lstrip().startswith("#"))
+        shim_call = _cmake_call_containing(
+            cm, "target_include_directories", "fake_audio")
+        if shim_call is None:
+            fail("[call] tests/CMakeLists.txt 没有把 fake_audio 目录真正加进 "
+                 "target_include_directories（只写个 `fake_audio.cpp` 源文件"
+                 "是不够的，注释里提过也不算），影子头不会被命中，测试实际在"
+                 "链真的 QtMultimedia —— 那就会**依赖开发机的声卡**。")
+        elif not re.search(r"^\s*\w+\s+BEFORE\b", shim_call.split("(", 1)[1]):
+            fail("[call] 引用 fake_audio 的那次 target_include_directories "
+                 "必须带 BEFORE：否则影子头排在 Qt 的 include 之后，"
+                 "`#include <QAudioFormat>` 仍会命中真 Qt 头。必须只看"
+                 "**这一次**调用，别处的 BEFORE 不能算数。")
+        if "ACC_CALL_SESSION_TEST" not in cm:
+            fail("[call] tests/CMakeLists.txt 没有真正定义 "
+                 "ACC_CALL_SESSION_TEST（注释里提过不算），影子头的安全阀会"
+                 "直接 #error，测试根本编译不过。")
+
+    for shim in ("QAudioFormat", "QAudioInput", "QAudioOutput"):
+        p = os.path.join(root, "tests", "fake_audio", shim)
+        if not os.path.exists(p):
+            fail("[call] 缺少影子头 tests/fake_audio/%s。" % shim)
+            continue
+        code = strip_comments_and_strings(
+            io.open(p, encoding="utf-8", errors="replace").read())
+        if not (re.search(r"#\s*ifndef\s+ACC_CALL_SESSION_TEST", code)
+                and re.search(r"#\s*error\b", code)):
+            fail("[call] 影子头 tests/fake_audio/%s 必须带真正的 "
+                 "`#ifndef ACC_CALL_SESSION_TEST` + `#error` 安全阀（注释里"
+                 "提过不算）：它保证只有测试目标能命中替身，否则**产线目标"
+                 "一旦误命中就会拿替身跑，而且编译链接一切正常**。" % shim)
 
 
 def check_cross_repo_test_targets_are_unique(root, extra_root):
@@ -3507,6 +3720,7 @@ def main():
     check_monitor_client_contract_is_pinned(root, src_root)
     check_weather_service_contract_is_pinned(root, src_root)
     check_serial_light_contract_is_pinned(root, src_root)
+    check_call_session_contract_is_pinned(root, src_root)
     check_fake_fingerprint_builds_same_bytes(root, src_root)
     check_fingerprint_checksum_logic_is_not_duplicated(root, src_root)
     check_gated_wire_paths_have_resume_test(root, src_root)

@@ -97,13 +97,14 @@ cmake --build /tmp/desktop-tests
 ctest --test-dir /tmp/desktop-tests --output-on-failure
 ```
 
-当前 6 个目标：`desktop_protocol`（协议编解码）、`desktop_app_config`
+当前 7 个目标：`desktop_protocol`（协议编解码）、`desktop_app_config`
 （配置与灯控指令解析）、`desktop_signaling_server`（TCP 8887 信令服务端，
 真实 socket 端到端）、`desktop_monitor_client`（**UDP 50000 远程预览客户端**，
 真实 socket + 环回别名假门口机，31 个用例）、`desktop_weather_service`
 （**天气获取与文案格式化**，真实 QTcpServer 当天气接口，27 个用例）、
 `desktop_serial_light`（**串口灯控**，影子头替身取代 QSerialPort，
-34 个用例）。
+34 个用例）、`desktop_call_session`（**室内机通话：UDP 12345 双向音频 +
+UDP 23456 单向视频**，socket 用真的、只替声卡，33 个用例）。
 
 > `tests/CMakeLists.txt` 此前缺 `cmake_minimum_required`/`project()`，独立构建
 > 会直接配置失败；补上之后又会因为缺 `enable_testing()` 而"构建成功、
@@ -305,7 +306,7 @@ bind、`newConnection`、`readyRead` 派发、`disconnected` 清理一并被验�
 
 ## 关键约定（由自动化检查强制）
 
-以下五十九条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
+以下六十四条是本工程最容易在重构中被悄悄破坏、又最难靠运行测试发现的约定。
 `tools/verify.py` 已把它们变成提交前即可拦截的结构化检查。
 
 ### 1. 音视频通道只在接听后建立
@@ -846,19 +847,30 @@ a.write("l\n");            // 只有补上 A 自己的后半，才应出现 Call
 `tools/run_coverage.sh` 一键产出：
 
 ```
-已测文件 416 行（覆盖 398）+ 未测文件约 976 行 = 分母 1392
-近似总覆盖率 = 28.6%   （上表那个 95.7% 仅描述已测文件）
+已测文件 563 行（覆盖 529）+ 未测文件约 695 行 = 分母 1258
+近似总覆盖率 = 42.1%   （上表那个 94.0% 仅描述已测文件）
 ```
 
 被测到的文件覆盖度本身不错：`src/core/net/signaling_server.cpp` 76/76 = 100%，
 `src/core/weather/weather_service.cpp` 56/56 = 100%，
 `src/hal/serial_light.cpp` 41/41 = 100%，`src/core/net/monitor_client.cpp`
-可达部分 100%（无"可达未测"行），合计 416 行中 398 行（95.7%）。
+可达部分 100%（无"可达未测"行），`src/core/media/call_session.cpp`
+130/146 = 89.0%，合计 563 行中 529 行（94.0%）。
 
-余下未覆盖的集中在 `src/config/app_config.cpp`（122 行测 109）与
+余下未覆盖的集中在 `src/config/app_config.cpp`（122 行测 109）、
+`src/core/media/call_session.cpp`（146 行测 130）、
 `src/core/net/protocol.h`（58 行测 56）：`app_config.cpp` 有 7 行
-**可达未测**（L65、L154-155、L273、L275、L283-284），`protocol.h`
-有 2 行（L152、L279）——**待办看的就是"可达未测"这一列**。
+**可达未测**（L65、L154-155、L273、L275、L283-284），
+`call_session.cpp` 有 9 行（L38、L71、L94、L119-121、L138-140），
+`protocol.h` 有 2 行（L152、L279）——**待办看的就是"可达未测"这一列**。
+
+> `call_session.cpp` 那 9 行是工具口径的**误分类**（见 §63）：它们是
+> `startAudioSocket()` / `startAudioOutput()` / `startAudioInput()` 开头的
+> "已建过就早返回 / 先拆旧的"幂等守卫。工具按"所在函数有调用者"判为可达，
+> 但它们实际**不可达** —— 前提是 `stop()` 无条件把四个成员指针置空，而
+> `start()` 在 running 时必定先 `stop()`、不 running 时指针本来也是空。
+> 与其留着当待办，不如把**这个前提**交给规则钉住
+> （`check_call_session_contract_is_pinned` 第 4 条）。
 
 **数字正确、口径错误，比没有数字更危险** —— 它会让人停止寻找缺口。
 
@@ -1460,6 +1472,208 @@ re.findall(r'^FAIL!\s*:', out, re.M)
 > `len(code) != len(text)` 的断言，长度一旦不等就返回 `None` 让调用方报
 > "规则自身需修复"，绝不悄悄用错位的切片。
 
+### 60. 双工通话：**socket 用真的，只替声卡**
+
+`src/core/media/call_session.cpp`（298 行）此前**从未被任何测试目标链接**，
+却是两条协议硬约束的室内机一侧：
+
+- **UDP 12345** 双向音频，裸 PCM（S16_LE / 16000Hz / 单声道），**无包头**，
+  每包 320 帧 / 640 字节；
+- **UDP 23456** 单向视频，门口机 → 室内机，每包一帧**完整 JPEG**，
+  不重组、不重传。
+
+门口机那侧有测试、室内机这侧没有 —— 于是门口机改了字节，这边仍然全绿，
+而互操作已经断了。
+
+**关键决定：端口是协议常量，不能挪到别的端口去测。** 第 31 轮的
+`MonitorClient`（UDP 50000）测法是把端口参数化到临时端口，因为它本来就
+接受端口注入；`CallSession` 不行 —— `12345`/`23456` 是写死的协议常量，
+编造一个"可注入端口"的接缝就等于改产品代码去迁就测试。所以这里让
+`CallSession` 在**真实协议端口**上收发，用另一个 `QUdpSocket` 充当门口机。
+
+探针实测（`%TEMP%\probe34\result17.txt`）确认本机可行：
+
+```
+bind(AnyIPv4,12345,ShareAddress) = true
+readDatagram -> 640 字节  sender=127.0.0.2:52803（与发送端一致）
+bind(Any,23456,ShareAddress)     = true
+```
+
+**只有声卡是替身。** 本机确实有可用音频设备（探针 `result16.txt`：
+`QAudioOutput::start()` 非空、`QAudioInput::start()` 非空），但把单元测试
+绑在**开发机的真实声卡**上，结果就取决于那台机器（有没有声卡、是否被独占、
+支不支持 16k 单声道）——那正是"在我这儿能跑"的坑。替身让音频路径完全确定。
+
+替身机制沿用第 56 轮的**影子头**：`tests/fake_audio/` 下放名为
+`QAudioFormat` / `QAudioInput` / `QAudioOutput` 的头，用
+`target_include_directories(... BEFORE PRIVATE ...)` 插到 Qt 的 include 之前；
+每个影子头都带 `#ifndef ACC_CALL_SESSION_TEST` + `#error` 安全阀。因为三个
+音频类全被替换，本目标**不需要** `Qt5::Multimedia`。
+
+> `QAudioFormat::bytesPerFrame()` 的替身实现必须与真 Qt **逐位一致**
+> （`(sampleSize/8) * channelCount`，任一参数未设置则 0）：被测代码用它算
+> `bytesPerMs = bytesPerFrame()*sampleRate/1000`，进而算缓冲区大小 —— 那是
+> **产品的行为**，不能被替身悄悄改掉，否则断言的不是产品而是替身。
+
+结果：`desktop_test_call_session` **33 个用例**；故障注入
+`verify_call_session_test.py` **22 个变异全部被抓到**，另有 5 个**实测无
+判别力**的退化如实记录（见 §62）。
+
+探针 `result18.txt` 给出了可靠的失败路径造法：先用一个 socket **独占**绑住
+端口，`CallSession` 的 `ShareAddress` 绑定就必然失败（3/3 稳定复现），
+于是 `audioBindFailureEmitsError` / `videoBindFailureEmitsError` 不再是
+"碰运气能不能造出失败"，而是确定性的。
+
+### 61. 断言"来源端口"前先想清楚那是**谁的**端口
+
+第一版 `uplinkGoesToTheTerminalAddressAndPort` 里写了
+
+```cpp
+QCOMPARE(fromPort, terminalPort);   // 错
+```
+
+跑出来是 `Compared values are not the same`。想清楚才发现：`readDatagram`
+回填的 `fromPort` 是**发送方**（即 `CallSession` 的音频 socket）的端口，也就是
+协议端口 `12345`；而 `terminalPort` 是**接收方**（假门口机）的临时端口。
+两者本来就该不同，断言写反了。
+
+正确的断言是**两件事分开说**：
+
+- "发对了**目的**端口"由**能收到**本身证明 —— 那个临时端口只有 `terminal`
+  在监听，`CallSession` 若把包发去 `12345` 或别处，`terminal` 什么也收不到；
+- "来源是会话自己"则断言 `fromPort == kAudioPort`，并顺带断言
+  `from.isLoopback()`。
+
+> 教训：**先量再断言**。这个错误不是断言太松，而是把"来源"和"目的"搞混了，
+> 静态看代码很难发现，跑一次就暴露。
+
+### 62. 有些变异**就是抓不到** —— 实测确认后写进 `UNDETECTABLE`，别假装覆盖
+
+`verify_call_session_test.py` 里有 5 个退化**实测无判别力**。诚实地记录它们
+（而不是留一堆假断言让人以为这块被守住了），并**交给静态规则**
+（`check_call_session_contract_is_pinned`）守住意图：
+
+1. **两个口的 `ShareAddress`。** 探针 `result20.txt` A 组，三组对照全部是
+   `true / false`：
+
+   ```
+   A1 两者都带 ShareAddress : true / false
+   A2 第一个独占、第二个共享 : true / false
+   A3 第一个共享、第二个独占 : true / false
+   ```
+
+   也就是说"能不能重复绑同一端口"取决于**本机 socket 语义**，与共享标志
+   无关（Windows 上 `SO_REUSEADDR` 并不允许两个 socket 同时绑同一 UDP 端口）。
+   于是测不出差别。**但这属于跨平台行为差异**：Linux 上 `SO_REUSEADDR`
+   是允许重复绑的，若将来在 Linux 上跑测试并观察到差异，应立即把它提升为
+   真变异。
+
+2. **音频/视频 `readDatagram` 的返回值判断与缩容。** 探针 `result20.txt`
+   B 组：对 `0/1/4/100/640/678/1400/65507` 共 8 种长度，返回值**恒等于**
+   `pendingDatagramSize()`（不等次数 = 0）。UDP 上不会短读，这两句永不生效。
+   与第 31 轮的 `monitor_client` 结论一致。
+
+   > 注意：这段代码**仍然值得留着** —— 它防的是 Qt 实现变化与平台差异
+   > （`QByteArray::resize()` 不清零新分配字节，失败时尾部是未初始化内存）。
+   > 它属于"防御性但当前不可观测"，**不是死代码**。
+
+3. **上行语音的"未学到地址不发"守卫。** 探针 `result19.txt`：
+
+   ```
+   默认 QHostAddress: isNull=true  protocol=-1
+   writeDatagram(空地址, 有效端口) 返回 = -1   sink 收到 = 无
+   writeDatagram(127.0.0.2, 0)     返回 = 640
+   对照 writeDatagram(127.0.0.2, sink端口) 返回 = 640  sink 收到 = 有
+   ```
+
+   地址为空时 **Qt 自己就拒绝发送**，所以那道
+   `if (!m_deviceAddress.isNull() && m_devicePort != 0)` 与 Qt 内部校验重叠。
+   保留它是**可读性 + 显式意图**，不是唯一防线。
+
+夹具里为此单列 `UNDETECTABLE` 段，逐个**确认必须抓不到**；一旦某个竟然被抓
+到了，夹具会报错
+
+```
+*** 竟然被抓到了（N 条 FAIL, rc=X）
+    => 它已可观测，应提升为真变异，而不是继续免责
+```
+
+这样"不可观测"这个判断本身也是**被验证过的**，不会随着 Qt 或平台变化而
+悄悄变成过期的免责声明。
+
+还补了一个**真能区分**的用例 `startForgetsTheLearnedReturnAddress`：
+重复 `start()` 必须先 `stop()`，而 `stop()` 会清掉学到的回传地址。少了那句
+`if (m_running) stop();`，新通话**还没听到对方**就会把本地语音发到**上一次
+通话的对端地址**去 —— 这是端口本身区分不出来的（自己已绑着 12345 时再绑一次，
+无论是否先 `stop()` 都拿不到干净端口）。
+
+### 63. 新加一个**同类**测试目标，会把旧规则的宽松正则变成**假绿**
+
+这是第 34 轮**加测试时才暴露出来**的一个既有规则缺陷，价值超出本轮本身。
+
+`check_serial_light_contract_is_pinned` 里检查影子头必须带 `BEFORE` 的那条正则
+原本是：
+
+```python
+re.search(r"target_include_directories\s*\(\s*\w+\s+BEFORE\b", cm)
+```
+
+它匹配**任意**带 `BEFORE` 的目标。`serial_light` 是当时唯一一个影子头目标，
+所以"能匹配上"等价于"serial_light 带了 BEFORE"，规则看着是好的。
+
+第 34 轮新增了 `desktop_test_call_session`，它**也**带 `BEFORE`。于是把
+serial_light 那行 `BEFORE` 删掉之后，正则**仍然命中**（命中的是新目标），
+规则静默通过 —— `verify_serial_light_rule.py` 的故障注入当场报出
+
+```
+CMake 去掉 BEFORE（影子头排在 Qt 之后）  *** 未被抓到（假绿）rc=0
+```
+
+**为什么危险：** 这一类"正则匹配了同类结构里的别处"的假绿，不会因为被测
+代码变坏而报警。它平时完全沉默，只在有人真的删掉 `BEFORE` 时才失效 ——
+而那一刻正是最需要它响的时候。丢掉 `BEFORE` 的后果还很隐蔽：影子头排在 Qt
+的 include 之后，`#include <QSerialPort>` / `<QAudioFormat>` 会命中**真 Qt 头**，
+测试照样编译、照样通过，只是在测真硬件 —— 换成另一台机器就变脸。
+
+**修法：** 新增 `_cmake_call_containing(text, command, marker)`，先按括号配对
+把**包含该影子头目录**的那一次 `target_include_directories(...)` 调用整段框
+出来，再**只在这段里**找 `BEFORE`。找不到该调用就报"规则自身需修复"，
+而不是假通过。call_session 的同类检查从一开始就用这个函数。
+
+> 教训：**"当前仓库能过"证明不了规则有判别力** —— 只有当同类结构只有一个
+> 实例时，宽松正则才**碰巧**等价于精确判断。新增第二个实例就会拆掉这层巧合。
+> 所以每加一个同类目标，都要重跑**所有**相关夹具，而不只是新写的那个。
+> 本条正是这样被发现的：新夹具跑绿了，旧夹具红了。
+
+### 64. 那 9 行"可达未测"其实是**误分类** —— 钉住前提，而不是留作待办
+
+覆盖率报告把 `call_session.cpp` 的 9 行算作「可达未测」，依据是"所在函数
+在生产代码里有调用者"（`coverage_report.py` 的 `member_functions` /
+`called_method_names`）。按工具的定义没错，但结论错了：
+
+- L71 `return true;`（`startAudioSocket()` 的 `if (m_audioSocket)` 早返回）
+- L94 同上（`startVideoSocket()`）
+- L119-121（`startAudioOutput()` 里"先拆旧的输出"）
+- L138-140（`startAudioInput()` 里"先拆旧的输入"）
+
+它们真正**不可达**，理由是：`start()` 是这三个函数的唯一调用者；`start()`
+在 `m_running` 为真时必定先 `stop()`，而 `stop()` **无条件**把
+`m_audioSocket` / `m_videoSocket` / `m_audioOutput` / `m_audioInput` 全部置空；
+`m_running` 为假时这些指针本来也是空（构造函数不建任何东西）。
+
+**关键点：** "这 9 行不可达"这个结论**依赖 `stop()` 清空指针这个不变量**。
+一旦有人从 `stop()` 里删掉某一行，那些守卫立刻变成**真实可达**的代码路径，
+而且很可能是个真 bug（残留的 socket 会带着旧连接进入新通话）。
+
+所以正确做法不是把这 9 行当"待办"永久供着（那既做不完、也不会有人看），
+而是把**它们不可达的前提**钉住：规则的第 4 条要求 `stop()` 里四个成员**各自
+都有一条无条件的 `member = nullptr;`**。前提破了就响。故障注入分别删掉四个
+`if` 块，四个变异全部被抓到。
+
+> 这也是对「可达未测」这一列的**主动清理**：它不只有"没写测试"一种成因，
+> 还有"工具口径不够精细"这一种。后者该修正的是**判断依据**，而不是补一个
+> 假装能覆盖不可达代码的测试（那种测试只能靠反射/私有点击硬凑，脆弱且无意义）。
+
 ## 开发约定
 
 - **标准**：C++11
@@ -1510,6 +1724,8 @@ python3 tools/verify_weather_service_rule.py
 python3 tools/verify_weather_service_test.py
 python3 tools/verify_serial_light_rule.py
 python3 tools/verify_serial_light_test.py
+python3 tools/verify_call_session_rule.py
+python3 tools/verify_call_session_test.py
 bash tools/run_coverage.sh
 
 # 3. 跨仓库协议一致性
