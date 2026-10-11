@@ -203,11 +203,35 @@ private:
     quint16 m_lastSenderPort = 0;
 };
 
-/// 尝试"排他"绑定 Any:50000（不带 ShareAddress）。成功说明端口当前空闲。
+/// 探测 `127.0.0.1:50000` 能否被**排他**绑定（不带 ShareAddress）：
+/// 绑得上说明当前没有任何 socket 占着该端口；绑不上说明已被占用。
+///
+/// 为什么探 `127.0.0.1` 而不是 `Any`（Linux 实测修正）
+/// --------------------------------------------------
+/// 原先这里探的是 `QHostAddress::Any`。它在 Windows 上能用，但在 Linux 上
+/// 会被**假门口机对 127.0.0.2 的合法占用**顶成"已占用"，于是所有
+/// "在 FakeTerminal 存活期间断言端口空闲"的用例都会失败。实测矩阵：
+///
+///   场景                                探 Any      探 127.0.0.1
+///   真空闲                              free        free
+///   仅 fake@127.0.0.2（本测试的常态）    OCCUPIED ✗  free ✓
+///   fake@.2 + client@Any                OCCUPIED    OCCUPIED
+///   仅 client@Any（无 fake）             OCCUPIED    OCCUPIED
+///   排他@Any 持有                        OCCUPIED    OCCUPIED
+///
+/// 根因是两个平台对 `SO_REUSEADDR` 的语义不同：Windows 允许"通配地址的排他
+/// 绑定"与"具体地址的复用绑定"共存；Linux 则把 `0.0.0.0:50000` 与
+/// `127.0.0.2:50000` 视为同一端口的冲突绑定而直接拒绝。失败出在**夹具的
+/// 探测地址**上，与被测的 MonitorClient 无关。
+///
+/// 探 127.0.0.1 **保留了全部判别力**：MonitorClient 绑的是 `Any`，只要它还
+/// 占着端口，对 127.0.0.1 的排他绑定在两个平台上都会失败。因此
+/// "stop()/析构后端口释放"这类断言该抓的退化照样能抓到（可用故障注入
+/// "stop() 不关闭 socket" 实测确认）。
 bool previewPortIsFree()
 {
     QUdpSocket probe;
-    const bool ok = probe.bind(QHostAddress::Any, kPreviewPort);
+    const bool ok = probe.bind(QHostAddress::LocalHost, kPreviewPort);
     if (ok) {
         probe.close();
     }

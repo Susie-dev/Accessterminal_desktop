@@ -59,6 +59,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 # 注意：判定 FAIL 行只看行首 ``FAIL!``，**不要**去匹配用例名的形状。
 # 数据驱动用例输出的是 ``Class::case(desk)`` 而不是 ``Class::case()``，
 # 用 ``\w+::(\w+)\(\)`` 会漏掉它们，把正常的断言失败误判成崩溃。
@@ -76,20 +77,49 @@ if len(sys.argv) > 1:
     print("提示: 本脚本不需要参数，已忽略: %s" % " ".join(sys.argv[1:]))
 
 
-D = r'C:\Users\user\Desktop\linux_ai\Accessterminal_desktop'
+# ---------------------------------------------------------------------------
+# 路径：由脚本自身定位，跨平台可跑。
+#
+# 原先这里写死 Windows 路径（C:\Users\user\...）并依赖 %TEMP%，结果是本夹具
+# **只能在作者那一台机器上运行**：在 Linux 上直接 KeyError: 'TEMP' 退出。
+# 而"夹具必须真的能跑"正是本工程的核心约定（README 开发约定第 N 条），
+# 一个跑不起来的夹具等于没有判别力。现改为：
+#
+#   - 仓库根由 __file__ 反推（tools/ 的上一级），可用第 1 个参数覆盖；
+#   - 构建目录走 tempfile，尊重 TMPDIR/TEMP；
+#   - 可执行文件与 .obj 的名称按平台推断（Windows 有 .exe 与 .obj，
+#     Linux 无后缀且 .o）。
+#
+# 用法（两平台一致）：
+#   python3 tools/verify_monitor_client_test.py [<仓库根>]
+# ---------------------------------------------------------------------------
+_HERE = os.path.dirname(os.path.abspath(__file__))
+D = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else os.path.dirname(_HERE)
 SRC = os.path.join(D, 'src', 'core', 'net', 'monitor_client.cpp')
-MSYS = r'C:\Users\user\.dsh\toolchains\msys64'
-CMAKE = os.path.join(MSYS, 'mingw64', 'bin', 'cmake.exe')
-BUILD = os.path.join(os.environ['TEMP'], 'fi31win')
-EXE = os.path.join(BUILD, 'desktop_test_monitor_client.exe')
-OBJ = os.path.join(
-    BUILD, 'CMakeFiles', 'desktop_test_monitor_client.dir', 'C_', 'Users',
-    'user', 'Desktop', 'linux_ai', 'Accessterminal_desktop', 'src', 'core',
-    'net', 'monitor_client.cpp.obj')
+
+# cmake：优先用 PATH 里的，找不到再回退到 MSYS2 的常见位置。
+CMAKE = shutil.which('cmake') or os.path.join(
+    r'C:\Users\user\.dsh\toolchains\msys64', 'mingw64', 'bin', 'cmake.exe')
+
+BUILD = os.path.join(tempfile.gettempdir(), 'fi_monitor_client')
+_EXE_SUFFIX = '.exe' if os.name == 'nt' else ''
+_OBJ_SUFFIX = '.obj' if os.name == 'nt' else '.o'
+EXE = os.path.join(BUILD, 'desktop_test_monitor_client' + _EXE_SUFFIX)
+
+# .obj/.o 的中间路径由构建目录到源文件的相对位置决定，不能写死作者机器的
+# 目录名：把仓库根相对构建目录拼出来，并只取盘符/根之后的部分（CMake 会
+# 把绝对路径里的 ':' 等字符转义成 '_'）。
+_REL_SRC = os.path.relpath(SRC, os.path.splitdrive(BUILD)[0] + os.sep) \
+    if os.name == 'nt' else os.path.relpath(SRC, os.sep)
+OBJ = os.path.join(BUILD, 'CMakeFiles', 'desktop_test_monitor_client.dir',
+                   _REL_SRC + _OBJ_SUFFIX)
 
 ENV = dict(os.environ)
-ENV['PATH'] = (os.path.join(MSYS, 'mingw64', 'bin') + os.pathsep
-               + os.path.join(MSYS, 'usr', 'bin') + os.pathsep + ENV['PATH'])
+# 仅在 MSYS2 存在时才改 PATH，避免污染 Linux 的 PATH。
+for _maybe in (r'C:\Users\user\.dsh\toolchains\msys64\mingw64\bin',):
+    if os.path.isdir(_maybe):
+        ENV['PATH'] = _maybe + os.pathsep + ENV.get('PATH', '')
+
 
 
 def read_src():
