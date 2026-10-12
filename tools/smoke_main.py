@@ -23,6 +23,7 @@
 （returncode 不为负）。"被 SIGTERM 结束"在这里是正常收场。
 """
 import io
+import locale
 import os
 import re
 import signal
@@ -68,13 +69,46 @@ def launch(app, args, logpath):
     return proc, log
 
 
+def read_log(logpath):
+    """按**实际编码**读日志，而不是硬编码 utf-8。
+
+    第 45 轮实测修正：在中文 Windows 上，Qt 的 `qInfo()` 把汉字按**本地 ANSI
+    代码页（GBK/CP936）**写进重定向的日志，而不是 UTF-8。实测字节：
+
+        [ 306 364 266 257 ] ...        # 306 364 = "启动" 的 GBK 编码
+
+    原先这里用 `io.open(..., encoding="utf-8", errors="replace")` 读，
+    中文全部变成 U+FFFD，于是 `"服务端监听端口" in text` **永远为假** ——
+    这个冒烟测试在中文 Windows 上从未真正通过过（`desktop_main_smoke`
+    长期失败，而失败信息里只看到字体警告，看不出是编码问题）。
+
+    做法：先按 UTF-8 严格解码；失败就依次尝试本地代码页（`locale.getpreferredencoding`）、
+    GBK、latin-1。**最后一定有一个能成功**（latin-1 永不失败），
+    所以这个函数不会抛异常。
+    """
+    raw = io.open(logpath, "rb").read()
+    if not raw:
+        return ""
+    encodings = ["utf-8", locale.getpreferredencoding(False), "gbk", "latin-1"]
+    seen = set()
+    for enc in encodings:
+        if not enc or enc.lower() in seen:
+            continue
+        seen.add(enc.lower())
+        try:
+            return raw.decode(enc)      # 严格解码：不静默替换
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw.decode("latin-1", "replace")
+
+
 def wait_for_marker(logpath, marker, timeout=15.0):
     """轮询日志文件，直到出现 marker 或超时。"""
     deadline = time.time() + timeout
     text = ""
     while time.time() < deadline:
         try:
-            text = io.open(logpath, encoding="utf-8", errors="replace").read()
+            text = read_log(logpath)
         except Exception:
             text = ""
         if marker in text:

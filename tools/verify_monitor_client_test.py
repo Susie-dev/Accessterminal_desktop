@@ -109,12 +109,38 @@ _OBJ_SUFFIX = '.obj' if os.name == 'nt' else '.o'
 EXE = os.path.join(BUILD, 'desktop_test_monitor_client' + _EXE_SUFFIX)
 
 # .obj/.o 的中间路径由构建目录到源文件的相对位置决定，不能写死作者机器的
-# 目录名：把仓库根相对构建目录拼出来，并只取盘符/根之后的部分（CMake 会
-# 把绝对路径里的 ':' 等字符转义成 '_'）。
-_REL_SRC = os.path.relpath(SRC, os.path.splitdrive(BUILD)[0] + os.sep) \
-    if os.name == 'nt' else os.path.relpath(SRC, os.sep)
-OBJ = os.path.join(BUILD, 'CMakeFiles', 'desktop_test_monitor_client.dir',
-                   _REL_SRC + _OBJ_SUFFIX)
+# 目录名。**这里曾经算错过，导致整个夹具静默失效**（第 45 轮实测修正）：
+#
+# 原先写法是 `os.path.relpath(SRC, 'C:\\')` -> `Users/user/...`，
+# 但 CMake 在 Windows 上会把绝对路径里的 **';' 与 ':' 转义成 '_'**，
+# 真实路径是 `C_/Users/user/...`。于是推算出的 OBJ 根本不存在，
+# `getmtime` 返回 0，`t1 <= t0` 恒真 —— 每个变异都报"未重编"，
+# 20 个变异全部算"夹具错误"，而它**看起来只是在报错，不像失效**。
+#
+# 正确做法：不要自己拼，直接**从构建目录里找**那个唯一的目标文件。
+# 这样平台差异（Windows 的 `C_` 转义、Linux 的相对路径）都不用管，
+# 也不再依赖作者的目录名。
+_OBJ_DIR = os.path.join(BUILD, 'CMakeFiles',
+                        'desktop_test_monitor_client.dir')
+
+
+def find_obj():
+    """在构建目录里找出本目标编出来的 monitor_client 目标文件。
+
+    返回 None 表示找不到 —— 调用方必须把这种情况当成**夹具错误**，
+    而不是退回"mtime 恒为 0、于是永远报未重编"的静默失效。
+    """
+    if not os.path.isdir(_OBJ_DIR):
+        return None
+    want = os.path.basename(SRC) + _OBJ_SUFFIX
+    for root, _dirs, files in os.walk(_OBJ_DIR):
+        for fn in files:
+            if fn == want:
+                return os.path.join(root, fn)
+    return None
+
+
+OBJ = None  # 基线构建后再确定；见 main()
 
 ENV = dict(os.environ)
 # 仅在 MSYS2 存在时才改 PATH，避免污染 Linux 的 PATH。
@@ -429,6 +455,17 @@ def main():
         print('基线构建失败:')
         print((rb.stdout + rb.stderr).decode('utf-8', 'replace')[-1500:])
         return 2
+
+    # 基线构建完成后定位目标文件。找不到就是夹具坏了 —— 绝不能继续，
+    # 否则 getmtime 恒为 0，每个变异都会以"未重编"收场（静默失效）。
+    global OBJ
+    OBJ = find_obj()
+    if OBJ is None:
+        print('[夹具错误] 在 %s 下找不到 %s 的目标文件；'
+              '若构建布局变了，请修正 find_obj()' % (_OBJ_DIR,
+                                                      os.path.basename(SRC)))
+        return 2
+    print('目标文件: %s' % os.path.relpath(OBJ, BUILD))
     print()
 
     problems = []

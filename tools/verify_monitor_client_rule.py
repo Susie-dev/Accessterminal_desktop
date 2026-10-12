@@ -82,9 +82,21 @@ MUT = [
     ("停止文本加换行",
      MC, 'QByteArrayLiteral("stop")', 'QByteArrayLiteral("stop\\n")'),
 
-    # 端口硬编码：protocol::kPreviewPort 在文件里出现 5 次，全部替换。
+    # 端口硬编码：protocol::kPreviewPort 在文件里出现 6 次，全部替换。
+    #
+    # 这个计数**曾经是 5**，后来变成 6 —— 第 45 轮才被发现：
+    # `48f89dd`（退出监看时给门口机发 stop）在 stop() 里新增了一处
+    # `writeDatagram(..., protocol::kPreviewPort)`，但**没有同步这里的计数**。
+    # 于是夹具变成 `锚点出现 6 次（期望 5）` 的**夹具错误**并一直红着，
+    # 而它看起来只像"某个变异有问题"，很容易被当成环境噪声忽略。
+    #
+    # 计数型锚点的固有风险：被计数的那个 token 是**正常会被修改**的东西
+    # （这里每加一处端口引用就该改一次）。改代码的人不会知道这个数字在夹具里。
+    # 保留计数是因为它能证明"全部替换"，但每次改动 monitor_client.cpp 都要
+    # 顺手核对它 —— 这也是本仓库把"夹具长期红着必须解释"写进 README 第 66 条的
+    # 直接起因。
     ("端口硬编码 50000",
-     MC, 'protocol::kPreviewPort', '50000', 5),
+     MC, 'protocol::kPreviewPort', '50000', 6),
 
     # 只删 onVideoFrameReady 里那道门。**必须带上 frame.isNull()**
     # 这个限定，否则会连 on_btngetframe_clicked 里的 `if (!m_cameraActive)`

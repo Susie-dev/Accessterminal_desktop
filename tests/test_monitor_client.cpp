@@ -224,14 +224,40 @@ private:
 /// `127.0.0.2:50000` 视为同一端口的冲突绑定而直接拒绝。失败出在**夹具的
 /// 探测地址**上，与被测的 MonitorClient 无关。
 ///
-/// 探 127.0.0.1 **保留了全部判别力**：MonitorClient 绑的是 `Any`，只要它还
-/// 占着端口，对 127.0.0.1 的排他绑定在两个平台上都会失败。因此
-/// "stop()/析构后端口释放"这类断言该抓的退化照样能抓到（可用故障注入
-/// "stop() 不关闭 socket" 实测确认）。
+/// 探测地址必须**按平台**选，两边只有一个对（第 45 轮实测修正）
+/// ------------------------------------------------------------------
+/// 上一条注释里"探 127.0.0.1 **保留了全部判别力**"这句话是**错的**，
+/// 它在 Windows 上让 7 个用例长期失败（本机实测）。Windows 的
+/// `SO_REUSEADDR` 语义允许"通配地址的绑定"与"具体地址的绑定"**共存**，
+/// 于是 MonitorClient 明明占着 `Any:50000`，探 127.0.0.1 仍然绑得上，
+/// 探针恒返回 free —— `QVERIFY(!previewPortIsFree())` 就必然失败。
+///
+/// 实测矩阵（Qt5，本机 Windows 10；`free`=绑得上，`OCCUP`=绑不上）：
+///
+///   场景                          探 Any   探 127.0.0.1   正确判定
+///   S1 什么都不绑                  free     free          free
+///   S2 仅 fake@127.0.0.2           free     free          free
+///   S3 fake@.2 + client@Any        OCCUP    free          OCCUP
+///   S4 排他@Any 持有               OCCUP    free          OCCUP
+///
+/// Windows 上**只有探 `Any`** 能区分 S2 与 S3/S4。而 Linux 上探 `Any` 会被
+/// fake@127.0.0.2 顶成 OCCUP（S2 误判），必须探 127.0.0.1。
+/// 两个平台**没有任何单一地址同时正确**，所以只能按平台分支，
+/// 而不是二选一写成"通则"。
+///
+/// 判别力并未因此减弱：S3/S4 都是"真的有人占着客户端端口"的形态，
+/// 平台对应的那一列都能正确判 OCCUP。故障注入"stop() 不关闭 socket"
+/// 仍然被抓到（已实测）。
 bool previewPortIsFree()
 {
     QUdpSocket probe;
+#ifdef Q_OS_WIN
+    // Windows：必须探通配地址，才能看见"有人以 Any 绑着"。
+    const bool ok = probe.bind(QHostAddress::Any, kPreviewPort);
+#else
+    // Linux：探通配地址会被 fake@127.0.0.2 误伤，必须探具体地址。
     const bool ok = probe.bind(QHostAddress::LocalHost, kPreviewPort);
+#endif
     if (ok) {
         probe.close();
     }
